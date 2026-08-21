@@ -1,0 +1,31 @@
+{
+  "description": "satchel: portable volumes backed by SQLite + Litestream (one writer per volume)",
+  "documentation": "https://github.com/zephyraoss/satchel",
+  "entrypoint": ["/usr/local/bin/satchel", "plugin"],
+  "interface": {
+    "types": ["docker.volumedriver/1.0"],
+    "socket": "satchel.sock"
+  },
+  "network": { "type": "host" },
+  "linux": {
+    "capabilities": ["CAP_SYS_ADMIN"],
+    "devices": [{ "path": "/dev/fuse" }]
+  },
+  "mounts": [
+    { "source": "/var/lib/satchel", "destination": "/var/lib/satchel", "type": "bind", "options": ["rbind"] }
+  ],
+  "propagatedmount": "/var/lib/satchel/mounts",
+  "env": [
+    { "name": "SATCHEL_NODE_ID", "settable": ["value"] },
+    { "name": "SATCHEL_S3_ENDPOINT", "settable": ["value"] },
+    { "name": "SATCHEL_S3_REGION", "settable": ["value"], "value": "us-east-1" },
+    { "name": "SATCHEL_S3_BUCKET", "settable": ["value"] },
+    { "name": "SATCHEL_S3_ACCESS_KEY", "settable": ["value"] },
+    { "name": "SATCHEL_S3_SECRET_KEY", "settable": ["value"] },
+    { "name": "SATCHEL_S3_PATH_STYLE", "settable": ["value"], "value": "true" },
+    { "name": "SATCHEL_LEASE_TTL", "settable": ["value"], "value": "30s" },
+    { "name": "SATCHEL_SYNC_INTERVAL", "settable": ["value"], "value": "5s" },
+    { "name": "SATCHEL_METRICS_ADDR", "settable": ["value"], "value": "" },
+    { "name": "SATCHEL_LOG_LEVEL", "settable": ["value"], "value": "info" }
+  ]
+}

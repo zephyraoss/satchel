@@ -1,0 +1,6 @@
+/satchel
+/dist/
+*.db
+*.db-wal
+*.db-shm
+*.test

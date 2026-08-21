@@ -1,0 +1,21 @@
+[Unit]
+Description=satchel Docker volume plugin
+Documentation=https://github.com/zephyraoss/satchel
+Before=docker.service
+Requires=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/satchel/satchel.env
+ExecStart=/usr/local/bin/satchel plugin
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=150s
+KillSignal=SIGTERM
+StateDirectory=satchel
+RuntimeDirectory=docker/plugins
+RuntimeDirectoryPreserve=yes
+
+[Install]
+WantedBy=multi-user.target
