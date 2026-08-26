@@ -70,12 +70,16 @@ run_fio randwrite-4k  --rw=randwrite --bs=4k
 run_fio randrw-4k     --rw=randrw    --bs=4k --rwmixread=70
 run_fio randread-4k   --rw=randread  --bs=4k
 
-echo "small files: creating 2000 x 4 KiB"
-head -c 4096 /dev/urandom > /tmp/bench4k
+echo "small files: extracting 2000 x 4 KiB from a tar"
+SMALL="$SATCHEL_STATE_DIR.small"
+rm -rf "$SMALL" && mkdir -p "$SMALL/small"
+for i in $(seq 1 2000); do head -c 4096 /dev/urandom > "$SMALL/small/$i"; done
+tar -C "$SMALL" -cf "$SMALL.tar" small
 start=$(date +%s.%N)
-for i in $(seq 1 2000); do cp /tmp/bench4k "$MNT/small-$i"; done
+tar -C "$MNT" -xf "$SMALL.tar"
 end=$(date +%s.%N)
 awk -v s="$start" -v e="$end" 'BEGIN { printf "   %.0f files/s\n", 2000 / (e - s) }'
+rm -rf "$SMALL" "$SMALL.tar"
 
 echo "WAL file size (high-water mark): $(( $(stat -c %s "$WAL" 2>/dev/null || echo 0) / 1024 / 1024 )) MiB"
 echo "un-checkpointed WAL at end: $(( $(pending_wal_bytes) / 1024 / 1024 )) MiB"

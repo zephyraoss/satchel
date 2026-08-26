@@ -17,7 +17,7 @@
 
 Litestream stages WAL frames into local LTX files every `--sync-interval` (default 5s) and uploads them from there. A node that dies loses at most the last interval's writes plus whatever was staged locally but not yet uploaded. The lease expires after its TTL (default 30s) and the next mount restores the latest state in the bucket.
 
-`fsync` on a satchel file returns immediately: every write is already a committed SQLite transaction, so there is nothing extra to flush locally, and durability to the bucket is governed by the sync interval rather than by fsync. Applications that rely on fsync as a remote-durability barrier do not get that here.
+`fsync` on a satchel file returns immediately: every write is already a committed SQLite transaction, the local database is never fsynced because it is thrown away at the next mount anyway, and durability to the bucket is governed by the sync interval rather than by fsync. Applications that rely on fsync as a remote-durability barrier do not get that here.
 
 ## Performance shape
 

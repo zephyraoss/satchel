@@ -29,14 +29,39 @@ func (s WALState) PendingBytes() int64 {
 	return pending * (s.PageSize + 24)
 }
 
+func (db *DB) WALState() WALState {
+	f := db.walIndexFile()
+	if f == nil {
+		return WALState{}
+	}
+	return readWALState(f)
+}
+
+func (db *DB) walIndexFile() *os.File {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.walIndex == nil {
+		f, err := os.Open(db.path + "-shm")
+		if err != nil {
+			return nil
+		}
+		db.walIndex = f
+	}
+	return db.walIndex
+}
+
 func ReadWALState(dbPath string) WALState {
 	f, err := os.Open(dbPath + "-shm")
 	if err != nil {
 		return WALState{}
 	}
 	defer f.Close()
+	return readWALState(f)
+}
+
+func readWALState(f io.ReaderAt) WALState {
 	var header [walIndexPrefix]byte
-	if _, err := io.ReadFull(f, header[:]); err != nil {
+	if _, err := f.ReadAt(header[:], 0); err != nil {
 		return WALState{}
 	}
 	if header[12] == 0 {

@@ -435,7 +435,7 @@ func (n *node) Listxattr(ctx context.Context, dest []byte) (uint32, syscall.Errn
 }
 
 func (v *volumeFS) walSize() int64 {
-	return store.PendingWALBytes(v.dbPath)
+	return v.db.WALState().PendingBytes()
 }
 
 func (v *volumeFS) applyBackpressure(ctx context.Context) syscall.Errno {

@@ -54,7 +54,9 @@ The staged-but-not-uploaded LTX files live in `<state-dir>/dbs/.<vol>.db-litestr
 
 ## Local state
 
-`/var/lib/satchel/volumes/*.json` is the registry of volumes this node knows about. A node that has never seen a volume will adopt it on first `Get`/`Mount` if `vols/<volume>/` exists in the bucket. `dbs/` holds the SQLite file, its WAL, and Litestream's sidecar directory while a volume is mounted; `mounts/` holds the FUSE mountpoints. Both are wiped on every mount and unmount. Put the state dir on a real disk, not tmpfs: the WAL can reach ~1 GB under sustained writes before Litestream truncates it, and a full tmpfs surfaces as SIGBUS inside SQLite.
+`/var/lib/satchel/volumes/*.json` is the registry of volumes this node knows about. A node that has never seen a volume will adopt it on first `Get`/`Mount` if `vols/<volume>/` exists in the bucket. `dbs/` holds the SQLite file, its WAL, and Litestream's sidecar directory while a volume is mounted; `mounts/` holds the FUSE mountpoints. Both are wiped on every mount and unmount. Put the state dir on a real disk, not tmpfs: the WAL can reach ~1 GB under sustained writes before Litestream truncates it.
+
+Because the local copy is discarded on every mount and the bucket is the only durable copy, SQLite runs with `synchronous=OFF`: commits and checkpoints never fsync the state dir. A satchel crash loses nothing (the page cache survives it); a host crash loses at most what had not been uploaded, which is the same window as before. Checkpointing is left to Litestream (`wal_autocheckpoint=0`, `default checkpoint cadence), so un-checkpointed WAL is exactly the data Litestream has not yet staged.
 
 ## Shutdown
 

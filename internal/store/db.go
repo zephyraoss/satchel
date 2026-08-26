@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -55,9 +56,11 @@ CREATE TABLE IF NOT EXISTS xattrs (
 
 type DB struct {
 	*sql.DB
+	path      string
 	chunkSize int64
 	mu        sync.Mutex
 	prepared  map[string]*sql.Stmt
+	walIndex  *os.File
 }
 
 type Options struct {
@@ -78,7 +81,7 @@ func OpenWith(ctx context.Context, path string, opts Options) (*DB, error) {
 	}
 	sqlDB.SetMaxOpenConns(1)
 	sqlDB.SetConnMaxLifetime(0)
-	db := &DB{DB: sqlDB, chunkSize: opts.ChunkSize, prepared: map[string]*sql.Stmt{}}
+	db := &DB{DB: sqlDB, path: path, chunkSize: opts.ChunkSize, prepared: map[string]*sql.Stmt{}}
 	if err := db.initialize(ctx); err != nil {
 		sqlDB.Close()
 		return nil, err
@@ -91,8 +94,10 @@ func OpenWith(ctx context.Context, path string, opts Options) (*DB, error) {
 }
 
 func (db *DB) initialize(ctx context.Context) error {
-	if _, err := db.ExecContext(ctx, `PRAGMA page_size = 8192`); err != nil {
-		return err
+	for _, pragma := range []string{`PRAGMA page_size = 8192`, `PRAGMA wal_autocheckpoint = 0`} {
+		if _, err := db.ExecContext(ctx, pragma); err != nil {
+			return err
+		}
 	}
 	return db.Do(ctx, func(tx *Tx) error {
 		version, err := tx.meta("schema_version")
@@ -151,8 +156,14 @@ func (db *DB) Close() error {
 		stmt.Close()
 	}
 	db.prepared = nil
+	walIndex := db.walIndex
+	db.walIndex = nil
 	db.mu.Unlock()
-	return db.DB.Close()
+	err := db.DB.Close()
+	if walIndex != nil {
+		walIndex.Close()
+	}
+	return err
 }
 
 func (db *DB) prepareHotQueries(ctx context.Context) error {

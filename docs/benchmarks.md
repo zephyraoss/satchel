@@ -1,6 +1,19 @@
 # Benchmarks
 
-Measured 2026-08-21 on a 6-vCPU Xeon Platinum 8260 VM, Fedora, Linux 6.19, state dir on a virtio disk, Litestream 0.5.16, MinIO on the same host. Reproduce with `go test ./internal/backend/fuse/ -bench . -run xxx` (no replication) and `./test/bench/run.sh` (fio against a live mount with Litestream replicating at a 1s sync interval).
+Measured 2026-08-21 on a 6-vCPU Xeon Platinum 8260 VM, Fedora, Linux 6.19, Litestream 0.5.16, MinIO on the same host. Reproduce with `go test ./internal/backend/fuse/ -bench . -run xxx` (no replication) and `./test/bench/run.sh` (fio against a live mount with Litestream replicating at a 1s sync interval).
+
+The `go test` benchmarks put the database under `$TMPDIR`, which is tmpfs on Fedora, so the no-replication tables below are page-cache numbers. Set `TMPDIR` to a real disk to see what the filesystem costs; `run.sh` always uses `SATCHEL_STATE_DIR`.
+
+## Local disk and fsync
+
+The same VM's btrfs root (virtio, `compress=zstd`) takes ~80 ms per fsync. With SQLite's defaults (`synchronous=NORMAL`, `wal_autocheckpoint=1000`) every 8 MiB of WAL triggered a checkpoint that fsynced both files inside the committing transaction, which capped the FUSE backend at 20 MB/s sequential on that disk, 2.8 ms per small file and 2.2 ms per random 4 KiB write, regardless of Litestream. The local database is wiped on every mount, so satchel now runs `synchronous=OFF` and leaves checkpointing to Litestream. On the same disk, no replication:
+
+| workload | NORMAL + autocheckpoint | OFF, Litestream checkpoints |
+|---|---|---|
+| FUSE: sequential write 1 MiB | 20 MB/s | 95 MB/s |
+| FUSE: create 4 KiB file | 2.81 ms | 1.06 ms |
+| FUSE: random 4 KiB write | 2.21 ms | 0.48 ms |
+
 
 ## SQLite driver
 
@@ -52,7 +65,7 @@ A random 4 KiB write rewrites its whole chunk, which is also how much WAL it gen
 | random r/w 70/30, 4 KiB | 193 / 87 IOPS | 256 MiB |
 | random read, 4 KiB | 396 IOPS | (draining previous job) |
 
-With replication on, sustained write throughput is whatever Litestream can stage and upload, here ~20–30 MB/s of WAL against a MinIO on the same box. Bursts up to `--wal-limit` run at local speed; after that, writes block until Litestream checkpoints. The random-read number is depressed by Litestream and MinIO competing for the same six cores while draining 256 MiB of backlog; without replication the same read is ~2,900 IOPS.
+With replication on, sustained write throughput is whatever Litestream can stage and upload, here ~20–30 MB/s of WAL against a MinIO on the same box: every byte written lands on the one virtio disk four times (WAL, database, staged LTX, MinIO object), so the `synchronous=OFF` change does not move the sequential number on this machine. Paired runs of the same jobs on this VM vary by 2x for random writes and more for mixed r/w because the host is shared, so compare binaries back to back rather than against this table. Isolated random 4 KiB writes with replication went from ~670 to ~1,300 IOPS with the fsync-free configuration. Bursts up to `--wal-limit` run at local speed; after that, writes block until Litestream checkpoints. The random-read number is depressed by Litestream and MinIO competing for the same six cores while draining 256 MiB of backlog; without replication the same read is ~2,900 IOPS.
 
 Write amplification is the number to keep in mind when sizing the bucket link: a workload doing 400 random 4 KiB writes per second pushes ~28 MB/s of WAL, not 1.6 MB/s.
 
