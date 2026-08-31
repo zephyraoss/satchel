@@ -27,12 +27,12 @@ var (
 	}, []string{"reason"})
 	SyncDuration = promauto.NewHistogram(prometheus.HistogramOpts{
 		Name:    "satchel_sync_duration_seconds",
-		Help:    "Time spent in litestream sync at unmount.",
+		Help:    "Time spent publishing, checkpointing, and collecting garbage at unmount.",
 		Buckets: prometheus.ExponentialBuckets(0.1, 2, 10),
 	})
 	RestoreDuration = promauto.NewHistogram(prometheus.HistogramOpts{
 		Name:    "satchel_restore_duration_seconds",
-		Help:    "Time spent in litestream restore at mount.",
+		Help:    "Time spent restoring block generations at mount.",
 		Buckets: prometheus.ExponentialBuckets(0.1, 2, 10),
 	})
 )
@@ -41,13 +41,7 @@ func Handler() http.Handler {
 	return promhttp.Handler()
 }
 
-var (
-	WALBytes = promauto.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "satchel_wal_bytes",
-		Help: "Bytes of WAL frames not yet checkpointed into the database (litestream checkpoints after staging), sampled on write.",
-	}, []string{"volume"})
-	BackpressureEvents = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "satchel_backpressure_events_total",
-		Help: "Times writes were delayed because the WAL exceeded the configured limit.",
-	}, []string{"volume"})
-)
+var BackpressureEvents = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "satchel_backpressure_events_total",
+	Help: "Times writes were delayed because unpublished block generations exceeded the configured limit.",
+}, []string{"volume"})

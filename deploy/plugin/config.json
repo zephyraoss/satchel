@@ -1,5 +1,5 @@
 {
-  "description": "satchel: portable volumes backed by SQLite + Litestream (one writer per volume)",
+  "description": "satchel: portable ext4 volumes replicated to S3 (one writer per volume)",
   "documentation": "https://github.com/zephyraoss/satchel",
   "entrypoint": ["/usr/local/bin/satchel", "plugin"],
   "interface": {
@@ -9,7 +9,24 @@
   "network": { "type": "host" },
   "linux": {
     "capabilities": ["CAP_SYS_ADMIN"],
-    "devices": [{ "path": "/dev/fuse" }]
+    "devices": [
+      { "path": "/dev/nbd0" },
+      { "path": "/dev/nbd1" },
+      { "path": "/dev/nbd2" },
+      { "path": "/dev/nbd3" },
+      { "path": "/dev/nbd4" },
+      { "path": "/dev/nbd5" },
+      { "path": "/dev/nbd6" },
+      { "path": "/dev/nbd7" },
+      { "path": "/dev/nbd8" },
+      { "path": "/dev/nbd9" },
+      { "path": "/dev/nbd10" },
+      { "path": "/dev/nbd11" },
+      { "path": "/dev/nbd12" },
+      { "path": "/dev/nbd13" },
+      { "path": "/dev/nbd14" },
+      { "path": "/dev/nbd15" }
+    ]
   },
   "mounts": [
     { "source": "/var/lib/satchel", "destination": "/var/lib/satchel", "type": "bind", "options": ["rbind"] }
@@ -25,6 +42,10 @@
     { "name": "SATCHEL_S3_PATH_STYLE", "settable": ["value"], "value": "true" },
     { "name": "SATCHEL_LEASE_TTL", "settable": ["value"], "value": "30s" },
     { "name": "SATCHEL_SYNC_INTERVAL", "settable": ["value"], "value": "5s" },
+    { "name": "SATCHEL_DIRTY_LIMIT", "settable": ["value"], "value": "256MiB" },
+    { "name": "SATCHEL_CHECKPOINT_INTERVAL", "settable": ["value"], "value": "128" },
+    { "name": "SATCHEL_HISTORY_RETENTION", "settable": ["value"], "value": "168h" },
+    { "name": "SATCHEL_GC_GRACE", "settable": ["value"], "value": "24h" },
     { "name": "SATCHEL_METRICS_ADDR", "settable": ["value"], "value": "" },
     { "name": "SATCHEL_LOG_LEVEL", "settable": ["value"], "value": "info" }
   ]

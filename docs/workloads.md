@@ -1,32 +1,13 @@
 # Workload guidance
 
-## Good fits
+Satchel now exposes ext4, so applications receive normal Linux filesystem behavior. Databases no longer run through a second filesystem implemented as SQLite rows.
 
-- Application configuration and small state files
-- User uploads and media in the tens of thousands of files, low GB total
-- Caches that are nice to keep across a redeploy but cheap to lose
-- Single-process tools that keep their state in a directory (Gitea, Vaultwarden, Miniflux, Grafana's sqlite file, etc.)
+The default `durability=remote` mode publishes dirty blocks to S3 before an ext4 flush succeeds. Databases that use `fsync` correctly do not lose acknowledged transactions when a node fails. S3 latency becomes part of commit latency, so a database's own replication is still the better choice when it needs low-latency synchronous commits or automatic multi-node failover.
 
-## Poor fits
+`durability=async` keeps flushes local and publishes on the configured sync interval. It is faster for flush-heavy workloads, but a host failure may lose the last interval.
 
-- Postgres, MySQL, MongoDB, anything with its own WAL and fsync discipline. Every fsync becomes a SQLite transaction, and replication adds latency you will notice.
-- Anything that expects shared access from several nodes at once. Satchel enforces one writer; use JuiceFS, NFS, or an object store directly.
-- Volumes over a few GB. Restore-on-migrate downloads the whole database before the container starts.
+Good fits include application state, uploads, caches, development databases, and services that accept a small recovery-point window.
 
-## What a crash loses
+Satchel still permits only one writer. Use a shared filesystem or database replication when several nodes must modify the same data concurrently.
 
-Litestream stages WAL frames into local LTX files every `--sync-interval` (default 5s) and uploads them from there. A node that dies loses at most the last interval's writes plus whatever was staged locally but not yet uploaded. The lease expires after its TTL (default 30s) and the next mount restores the latest state in the bucket.
-
-`fsync` on a satchel file returns immediately: every write is already a committed SQLite transaction, the local database is never fsynced because it is thrown away at the next mount anyway, and durability to the bucket is governed by the sync interval rather than by fsync. Applications that rely on fsync as a remote-durability barrier do not get that here.
-
-## Performance shape
-
-Files are stored in 64 KiB chunks. Sequential I/O and whole-file rewrites are cheap; random 4 KiB writes rewrite a 64 KiB chunk each (about 1,400/s), so databases and append-heavy logs with small records are the wrong fit. Reads of recently touched data come from the kernel page cache. See [benchmarks.md](benchmarks.md).
-
-## Scaling past one replica
-
-| need | do this |
-|---|---|
-| many replicas reading the same config | `mode=ro` (v2) |
-| each replica with its own state | `scope=replica` (v2) |
-| true shared read/write | a shared filesystem, not satchel |
+Restore downloads every segment needed by the latest checkpoint and delta chain before mounting. Large volumes with little allocated data remain cheap because the local image is sparse, but Satchel does not yet fetch blocks lazily.

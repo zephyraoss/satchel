@@ -1,63 +1,47 @@
 # Operations
 
-## Storage node
+## Host setup
 
-Any S3-compatible service that supports conditional writes: MinIO, Cloudflare R2, SeaweedFS S3 gateway, AWS S3. Satchel verifies `If-None-Match` and `If-Match` at startup with a probe object under `leases/.probe-*` and refuses to start if the backend ignores them.
+Satchel needs the Linux NBD module and one `/dev/nbdN` device per mounted volume. Load the module before starting Docker or Satchel:
 
-Bucket layout:
-
+```sh
+modprobe nbd nbds_max=64
 ```
-vols/<volume>/...          litestream LTX files
-leases/<volume>.json       lease
-```
+
+The service also needs `CAP_SYS_ADMIN`, `mkfs.ext4`, and `mount`.
+
+## S3 requirements
+
+The bucket must implement conditional `PUT` requests with `If-Match` and `If-None-Match`. Satchel verifies both operations at startup. AWS S3, MinIO, and compatible services with those semantics work.
 
 ## Lease recovery
 
-If a node dies while holding a lease, the lease expires after the TTL (default 30s) and the next mount takes it over. If you need it sooner, `satchel vol lease break <volume>` deletes it after making you type the holder's name. Before doing that, be certain the old holder is gone: if it is still running it will fence itself on the next heartbeat (so no further replication happens), but any data it wrote since its last sync is lost.
+The active lease lives inside the volume's `state.json`. If a node dies, another node can take over after the lease expires. The default TTL is 30 seconds.
 
-## Read-only replicas
-
-`mode=ro` volumes restore the bucket state at mount time and never refresh while mounted. To roll out a config change to N read-only replicas: `satchel vol put` (or mount the `rw` volume somewhere, edit, unmount), then restart the replicas. They take no lease, so they never block the writer and the writer never blocks them.
-
-## Replica-scoped volumes
-
-`scope=replica` names each container's volume `<name>.r-<12 hex>` from a hash of Docker's mount id. They show up individually in `satchel vol ls`. `docker volume rm <name>` on a node removes that node's record and any replica volumes it knows about; leftovers from containers that died elsewhere have to be removed from the bucket with `satchel vol` or your S3 tooling (`vols/<name>.r-*/` and `leases/<name>.r-*.json`).
-
-## Seeding
-
-`seed=` is applied inside the first mount, after `litestream restore` finds nothing in the bucket and before the FUSE mount, in one transaction. A local path is read on the node doing the mount, so for anything other than a one-node cluster use an `s3://` tarball. Tar entries outside the archive root are rejected.
-
-## Metrics
-
-Enable with `--metrics-addr 127.0.0.1:9464`.
-
-| metric | meaning |
-|---|---|
-| `satchel_mounted_volumes` | volumes currently mounted on this node |
-| `satchel_lease_held{volume}` | 1 while this node holds the lease |
-| `satchel_lease_fenced_total{volume}` | times this node lost a lease and fenced |
-| `satchel_mount_failures_total{reason}` | `lease_held`, `lease_error`, `restore`, `backend` |
-| `satchel_restore_duration_seconds` | litestream restore at mount |
-| `satchel_sync_duration_seconds` | litestream shutdown + final sync at unmount |
-| `satchel_wal_bytes{volume}` | WAL frames not yet checkpointed; grows when litestream falls behind |
-| `satchel_backpressure_events_total{volume}` | times writes were paused because `satchel_wal_bytes` exceeded `--wal-limit` |
+`satchel vol lease break <volume>` clears the lease with a conditional write. A stale node cannot publish another generation after this operation, but applications on that node may keep receiving successful local writes until Satchel fences its NBD mount. Stop or isolate the old node before breaking a lease.
 
 ## Backpressure
 
-Litestream checkpoints the WAL only after it has staged the frames into its local LTX directory, so un-checkpointed WAL is a direct measure of how far behind it is. When that exceeds `--wal-limit` (default 256 MiB) satchel pauses FUSE writes, logs a warning, and resumes as soon as a checkpoint lands; reads keep working. If the pause persists, Litestream is either stopped or cannot reach the bucket; check its lines in the satchel log at `--log-level debug`.
+Each write copies the affected 4 KiB blocks into an in-memory generation. Failed uploads remain queued. Satchel pauses new writes once unpublished block data reaches `--dirty-limit`, which defaults to 256 MiB. Reads continue.
 
-The staged-but-not-uploaded LTX files live in `<state-dir>/dbs/.<vol>.db-litestream/` and are not counted by the limit. A long bucket outage grows that directory instead; bounding it is on the roadmap.
+The queue is memory-backed. In async mode, a process or host crash loses unpublished generations. In remote mode, Satchel does not acknowledge a filesystem flush until that queue has reached S3.
 
-## Mounting without Docker
+## Database durability
 
-`satchel mount <vol>` takes the lease, restores, mounts under `<state-dir>/mounts/<vol>` with live replication, prints the path, and unmounts cleanly on Ctrl-C. Useful for inspecting or seeding a volume from a workstation. It holds the lease, so the service cannot start while you have it mounted.
+Volumes default to `durability=remote`. An ext4 flush or FUA write syncs the local image, uploads all dirty blocks, writes a manifest, and conditionally advances `state.json` before returning success. If S3 is unavailable, the flush fails instead of claiming the transaction is durable.
+
+This adds S3 latency to database commits that call `fsync`. Ordinary reads and writes still use the local block device. Set `durability=async` only when the lower commit latency is worth a recovery-point window of up to the sync interval.
+
+## Checkpoints
+
+Satchel creates a full checkpoint when the delta chain reaches `--checkpoint-interval`. The default is 128 generations. In remote durability mode this happens on a filesystem flush, when NBD I/O is paused at a consistent boundary. Async volumes checkpoint during clean unmount. A checkpoint scans and uploads every non-zero block, so the flush or unmount that creates one takes longer for a large, full volume.
+
+Checkpoint parent links retain point-in-time history. `satchel vol restore` accepts either `--generation` or `--timestamp`. The defaults retain seven days of history and wait another 24 hours before deleting expired objects. Set `SATCHEL_HISTORY_RETENTION` and `SATCHEL_GC_GRACE` to change those windows. Clean unmounts run the collector automatically. `satchel vol gc <volume>` runs it for an idle volume and refuses to proceed while another node holds the lease.
 
 ## Local state
 
-`/var/lib/satchel/volumes/*.json` is the registry of volumes this node knows about. A node that has never seen a volume will adopt it on first `Get`/`Mount` if `vols/<volume>/` exists in the bucket. `dbs/` holds the SQLite file, its WAL, and Litestream's sidecar directory while a volume is mounted; `mounts/` holds the FUSE mountpoints. Both are wiped on every mount and unmount. Put the state dir on a real disk, not tmpfs: the WAL can reach ~1 GB under sustained writes before Litestream truncates it.
-
-Because the local copy is discarded on every mount and the bucket is the only durable copy, SQLite runs with `synchronous=OFF`: commits and checkpoints never fsync the state dir. A satchel crash loses nothing (the page cache survives it); a host crash loses at most what had not been uploaded, which is the same window as before. Checkpointing is left to Litestream (`wal_autocheckpoint=0`, `default checkpoint cadence), so un-checkpointed WAL is exactly the data Litestream has not yet staged.
+`<state-dir>/volumes` contains the local Docker registry. `<state-dir>/images` contains sparse images while mounted. `<state-dir>/mounts` contains ext4 mountpoints. Images are disposable and Satchel removes them after a clean unmount.
 
 ## Shutdown
 
-SIGTERM unmounts every mounted volume (FUSE unmount, Litestream shutdown with final sync, lease release) before exiting, with a two-minute budget. Stop satchel after the containers that use it; a FUSE unmount with open files is retried for five seconds and then fails, leaving the lease held until the plugin is restarted and unmounts cleanly.
+Stop containers before Satchel. On SIGTERM, Satchel unmounts each filesystem, publishes its final generation, releases the lease, detaches NBD, and removes the local image. A busy filesystem makes shutdown fail rather than discarding writes.

@@ -1,6 +1,4 @@
 /satchel
 /dist/
-*.db
-*.db-wal
-*.db-shm
+*.img
 *.test

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,201 +12,293 @@ import (
 
 	"github.com/docker/go-plugins-helpers/volume"
 
-	"github.com/zephyraoss/satchel/internal/backend/pack"
-	"github.com/zephyraoss/satchel/internal/lease"
-	"github.com/zephyraoss/satchel/internal/litestream/litestreamtest"
+	"github.com/zephyraoss/satchel/internal/backend"
 	"github.com/zephyraoss/satchel/internal/objectstore"
+	"github.com/zephyraoss/satchel/internal/replica"
 )
 
-func (m *memFetcher) Fetch(ctx context.Context, _ string, key string) (io.ReadCloser, error) {
-	obj, err := m.Get(ctx, key)
+type fakeBackend struct {
+	device *replica.Device
+}
+
+func (b *fakeBackend) Format(_ context.Context, imagePath, _ string) error {
+	file, err := os.OpenFile(imagePath, os.O_WRONLY, 0)
 	if err != nil {
+		return err
+	}
+	defer file.Close()
+	_, err = file.WriteAt([]byte("formatted"), 0)
+	return err
+}
+
+func (b *fakeBackend) Mount(_ context.Context, device *replica.Device, mountpoint string, _ backend.MountOptions) (backend.Unmounter, error) {
+	b.device = device
+	if err := os.MkdirAll(mountpoint, 0o755); err != nil {
 		return nil, err
 	}
-	return io.NopCloser(bytes.NewReader(obj.Data)), nil
+	return fakeUnmount{}, nil
 }
 
-type memFetcher struct{ *objectstore.Memory }
+type fakeUnmount struct{}
 
-type cluster struct {
-	store *memFetcher
-	ls    *litestreamtest.Fake
-}
+func (fakeUnmount) Unmount(context.Context) error { return nil }
+func (fakeUnmount) Abandon() error                { return nil }
 
-func newCluster() *cluster {
-	store := objectstore.NewMemory()
-	return &cluster{store: &memFetcher{store}, ls: litestreamtest.New(store)}
-}
-
-func (c *cluster) node(t *testing.T, id string) *Driver {
+func newTestDriver(t *testing.T, store objectstore.Store, node string) (*Driver, *fakeBackend) {
 	t.Helper()
-	d, err := New(Config{NodeID: id, StateDir: t.TempDir()}, c.store, &lease.Manager{Store: c.store, NodeID: id, TTL: time.Second}, c.ls, pack.New())
+	be := &fakeBackend{}
+	driver, err := New(
+		Config{NodeID: node, StateDir: t.TempDir(), MaxDirty: 1 << 20, CheckpointInterval: 1},
+		&replica.Remote{Store: store, TTL: time.Minute}, be,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return d
+	return driver, be
 }
 
-func TestRedeployRoundTripPreservesFiles(t *testing.T) {
-	c := newCluster()
-	a, b := c.node(t, "node-a"), c.node(t, "node-b")
-
-	if err := a.Create(&volume.CreateRequest{Name: "data"}); err != nil {
+func TestVolumeReplicatesBlockChanges(t *testing.T) {
+	store := objectstore.NewMemory()
+	driver, be := newTestDriver(t, store, "node-a")
+	if err := driver.Create(&volume.CreateRequest{Name: "data", Options: map[string]string{"size": "64MiB", "sync_interval": "1h"}}); err != nil {
 		t.Fatal(err)
 	}
-	resp, err := a.Mount(&volume.MountRequest{Name: "data", ID: "c1"})
-	if err != nil {
+	if _, err := driver.Mount(&volume.MountRequest{Name: "data", ID: "container"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(resp.Mountpoint, "hello.txt"), []byte("from node a"), 0o644); err != nil {
+	want := bytes.Repeat([]byte("payload"), 512)
+	if _, err := be.device.WriteAt(want, 4*replica.DefaultBlockSize); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.Unmount(&volume.UnmountRequest{Name: "data", ID: "c1"}); err != nil {
-		t.Fatal(err)
-	}
-
-	resp, err = b.Mount(&volume.MountRequest{Name: "data", ID: "c2"})
-	if err != nil {
-		t.Fatalf("mount on node b (volume never Created there): %v", err)
-	}
-	got, err := os.ReadFile(filepath.Join(resp.Mountpoint, "hello.txt"))
-	if err != nil || string(got) != "from node a" {
-		t.Fatalf("content on node b = %q, err=%v", got, err)
-	}
-	if err := os.WriteFile(filepath.Join(resp.Mountpoint, "more.txt"), []byte("from node b"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := b.Unmount(&volume.UnmountRequest{Name: "data", ID: "c2"}); err != nil {
+	if err := driver.Unmount(&volume.UnmountRequest{Name: "data", ID: "container"}); err != nil {
 		t.Fatal(err)
 	}
 
-	resp, err = a.Mount(&volume.MountRequest{Name: "data", ID: "c3"})
+	restored := filepath.Join(t.TempDir(), "image")
+	remote := &replica.Remote{Store: store}
+	state, err := remote.Restore(context.Background(), "data", restored)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer a.Unmount(&volume.UnmountRequest{Name: "data", ID: "c3"})
-	for file, want := range map[string]string{"hello.txt": "from node a", "more.txt": "from node b"} {
-		got, err := os.ReadFile(filepath.Join(resp.Mountpoint, file))
-		if err != nil || string(got) != want {
-			t.Fatalf("%s back on node a = %q, err=%v", file, got, err)
+	if state.Generation != 3 || state.Checkpoint != 3 {
+		t.Fatalf("state after format, data, and checkpoint generations = %+v", state)
+	}
+	file, err := os.Open(restored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	got := make([]byte, len(want))
+	if _, err := file.ReadAt(got, 4*replica.DefaultBlockSize); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("restored block data differs")
+	}
+}
+
+func TestFilesystemFlushPublishesRemoteGeneration(t *testing.T) {
+	store := objectstore.NewMemory()
+	driver, backend := newTestDriver(t, store, "node-a")
+	if err := driver.Create(&volume.CreateRequest{Name: "data", Options: map[string]string{"size": "64MiB"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := driver.Mount(&volume.MountRequest{Name: "data", ID: "container"}); err != nil {
+		t.Fatal(err)
+	}
+	before, _, err := driver.remote.Inspect(context.Background(), "data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := backend.device.WriteAt([]byte("committed"), 4*replica.DefaultBlockSize); err != nil {
+		t.Fatal(err)
+	}
+	if err := backend.device.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	after, _, err := driver.remote.Inspect(context.Background(), "data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Generation <= before.Generation || after.Checkpoint != after.Generation {
+		t.Fatalf("state after flush = %+v, want a published generation and checkpoint", after)
+	}
+	if err := driver.Unmount(&volume.UnmountRequest{Name: "data", ID: "container"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAsyncDurabilityDoesNotBlockFlushOnS3(t *testing.T) {
+	store := objectstore.NewMemory()
+	driver, backend := newTestDriver(t, store, "node-a")
+	options := map[string]string{"size": "64MiB", "durability": "async", "sync_interval": "1h"}
+	if err := driver.Create(&volume.CreateRequest{Name: "data", Options: options}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := driver.Mount(&volume.MountRequest{Name: "data", ID: "container"}); err != nil {
+		t.Fatal(err)
+	}
+	before, _, err := driver.remote.Inspect(context.Background(), "data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := backend.device.WriteAt([]byte("not-yet-remote"), 4*replica.DefaultBlockSize); err != nil {
+		t.Fatal(err)
+	}
+	if err := backend.device.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	after, _, err := driver.remote.Inspect(context.Background(), "data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Generation != before.Generation {
+		t.Fatalf("async flush advanced generation from %d to %d", before.Generation, after.Generation)
+	}
+	if err := driver.Unmount(&volume.UnmountRequest{Name: "data", ID: "container"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSecondNodeCannotMountHeldVolume(t *testing.T) {
+	store := objectstore.NewMemory()
+	first, _ := newTestDriver(t, store, "node-a")
+	second, _ := newTestDriver(t, store, "node-b")
+	request := &volume.CreateRequest{Name: "data", Options: map[string]string{"size": "64MiB"}}
+	if err := first.Create(request); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.Create(request); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.Mount(&volume.MountRequest{Name: "data", ID: "a"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := second.Mount(&volume.MountRequest{Name: "data", ID: "b"}); err == nil {
+		t.Fatal("second node mounted a held volume")
+	} else {
+		var held *replica.HeldError
+		if !errors.As(err, &held) {
+			t.Fatalf("mount error = %v", err)
 		}
 	}
-}
-
-func TestSecondNodeMountFailsWhileHeld(t *testing.T) {
-	c := newCluster()
-	a, b := c.node(t, "node-a"), c.node(t, "node-b")
-	if err := a.Create(&volume.CreateRequest{Name: "data"}); err != nil {
+	if err := first.Unmount(&volume.UnmountRequest{Name: "data", ID: "a"}); err != nil {
 		t.Fatal(err)
-	}
-	if err := b.Create(&volume.CreateRequest{Name: "data"}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := a.Mount(&volume.MountRequest{Name: "data", ID: "c1"}); err != nil {
-		t.Fatal(err)
-	}
-	_, err := b.Mount(&volume.MountRequest{Name: "data", ID: "c2"})
-	if err == nil || !strings.Contains(err.Error(), "volume data is held by node node-a") {
-		t.Fatalf("second mount err = %v", err)
-	}
-	if err := b.Remove(&volume.RemoveRequest{Name: "data"}); err == nil {
-		t.Fatal("remove while held on another node should fail")
-	}
-	if err := a.Unmount(&volume.UnmountRequest{Name: "data", ID: "c1"}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := b.Mount(&volume.MountRequest{Name: "data", ID: "c2"}); err != nil {
-		t.Fatalf("mount after release: %v", err)
 	}
 }
 
-func TestMountRefcountOnSameNode(t *testing.T) {
-	c := newCluster()
-	a := c.node(t, "node-a")
-	if err := a.Create(&volume.CreateRequest{Name: "data"}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := a.Mount(&volume.MountRequest{Name: "data", ID: "c1"}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := a.Mount(&volume.MountRequest{Name: "data", ID: "c2"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := a.Unmount(&volume.UnmountRequest{Name: "data", ID: "c1"}); err != nil {
-		t.Fatal(err)
-	}
-	if rec, _ := (&lease.Manager{Store: c.store}).Inspect(context.Background(), "data"); rec == nil {
-		t.Fatal("lease released while a mount is still active")
-	}
-	if err := a.Unmount(&volume.UnmountRequest{Name: "data", ID: "c2"}); err != nil {
-		t.Fatal(err)
-	}
-	if rec, _ := (&lease.Manager{Store: c.store}).Inspect(context.Background(), "data"); rec != nil {
-		t.Fatal("lease not released after last unmount")
-	}
+type failSegmentStore struct {
+	objectstore.Store
+	fail bool
 }
 
-func TestLostLeaseFencesVolume(t *testing.T) {
-	c := newCluster()
-	a := c.node(t, "node-a")
-	if err := a.Create(&volume.CreateRequest{Name: "data"}); err != nil {
+func TestFailedRemoteFlushCanBeRetried(t *testing.T) {
+	store := &failSegmentStore{Store: objectstore.NewMemory()}
+	driver, backend := newTestDriver(t, store, "node-a")
+	if err := driver.Create(&volume.CreateRequest{Name: "data", Options: map[string]string{"size": "64MiB"}}); err != nil {
 		t.Fatal(err)
 	}
-	resp, err := a.Mount(&volume.MountRequest{Name: "data", ID: "c1"})
+	if _, err := driver.Mount(&volume.MountRequest{Name: "data", ID: "container"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := backend.device.WriteAt([]byte("committed"), 4*replica.DefaultBlockSize); err != nil {
+		t.Fatal(err)
+	}
+	store.fail = true
+	if err := backend.device.Flush(); err == nil {
+		t.Fatal("flush succeeded while the object store was unavailable")
+	}
+	store.fail = false
+	if err := backend.device.Flush(); err != nil {
+		t.Fatalf("retry flush: %v", err)
+	}
+
+	path := filepath.Join(t.TempDir(), "restored")
+	if _, err := driver.remote.Restore(context.Background(), "data", path); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(resp.Mountpoint, "doomed.txt"), []byte("x"), 0o644); err != nil {
+	defer file.Close()
+	got := make([]byte, len("committed"))
+	if _, err := file.ReadAt(got, 4*replica.DefaultBlockSize); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.store.Delete(context.Background(), lease.Key("data")); err != nil {
+	if string(got) != "committed" {
+		t.Fatalf("restored data = %q", got)
+	}
+	if err := driver.Unmount(&volume.UnmountRequest{Name: "data", ID: "container"}); err != nil {
 		t.Fatal(err)
-	}
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		get, _ := a.Get(&volume.GetRequest{Name: "data"})
-		if _, fenced := get.Volume.Status["fenced"]; fenced {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("volume was not fenced after lease loss")
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	if _, err := a.Mount(&volume.MountRequest{Name: "data", ID: "c9"}); err == nil {
-		t.Fatal("mount on fenced volume should fail")
-	}
-	if err := a.Unmount(&volume.UnmountRequest{Name: "data", ID: "c1"}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := c.store.Get(context.Background(), c.ls.Key("data")); !errors.Is(err, objectstore.ErrNotFound) {
-		t.Fatalf("fenced node replicated anyway: err=%v", err)
-	}
-	if _, err := a.Mount(&volume.MountRequest{Name: "data", ID: "c2"}); err != nil {
-		t.Fatalf("remount after fence cleared: %v", err)
 	}
 }
 
-func TestRemoveDeletesRemote(t *testing.T) {
-	c := newCluster()
-	a := c.node(t, "node-a")
-	if err := a.Create(&volume.CreateRequest{Name: "data"}); err != nil {
+func (s *failSegmentStore) PutIfAbsent(ctx context.Context, key string, data []byte) (string, error) {
+	if s.fail && strings.Contains(key, "/segments/") {
+		return "", errors.New("injected segment upload failure")
+	}
+	return s.Store.PutIfAbsent(ctx, key, data)
+}
+
+func TestInitialPublishFailureRollsBackMount(t *testing.T) {
+	store := &failSegmentStore{Store: objectstore.NewMemory(), fail: true}
+	driver, _ := newTestDriver(t, store, "node-a")
+	if err := driver.Create(&volume.CreateRequest{Name: "data", Options: map[string]string{"size": "64MiB"}}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := a.Mount(&volume.MountRequest{Name: "data", ID: "c1"}); err != nil {
+	if _, err := driver.Mount(&volume.MountRequest{Name: "data", ID: "container"}); err == nil {
+		t.Fatal("mount succeeded despite the segment upload failure")
+	}
+
+	state := driver.volumes["data"]
+	state.mu.Lock()
+	mount := state.mounts["data"]
+	if mount.active || mount.device != nil || mount.unmounter != nil || mount.stopBeat != nil {
+		state.mu.Unlock()
+		t.Fatalf("failed mount was left active: %+v", mount)
+	}
+	state.mu.Unlock()
+
+	remoteState, _, err := driver.remote.Inspect(context.Background(), "data")
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := a.Unmount(&volume.UnmountRequest{Name: "data", ID: "c1"}); err != nil {
+	if remoteState.Lease != nil {
+		t.Fatal("failed mount retained its lease")
+	}
+	store.fail = false
+	if _, err := driver.Mount(&volume.MountRequest{Name: "data", ID: "container"}); err != nil {
+		t.Fatalf("retry mount: %v", err)
+	}
+	if err := driver.Unmount(&volume.UnmountRequest{Name: "data", ID: "container"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.Remove(&volume.RemoveRequest{Name: "data"}); err != nil {
+}
+
+func TestParseVolumeOptions(t *testing.T) {
+	defaults, err := ParseVolumeOptions(nil)
+	if err != nil {
 		t.Fatal(err)
 	}
-	keys, _ := c.store.List(context.Background(), "")
-	if len(keys) != 0 {
-		t.Fatalf("remote objects left behind: %v", keys)
+	if !defaults.RemoteDurability() {
+		t.Fatal("remote durability is not the default")
 	}
-	if _, err := a.Get(&volume.GetRequest{Name: "data"}); err == nil {
-		t.Fatal("volume still exists after remove")
+	opts, err := ParseVolumeOptions(map[string]string{
+		"mode": "ro", "scope": "replica", "durability": "async", "size": "2GiB", "filesystem": "ext4", "sync_interval": "2s",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !opts.ReadOnly() || !opts.PerReplica() || opts.RemoteDurability() || opts.Size != 2<<30 || opts.SyncInterval != 2*time.Second {
+		t.Fatalf("unexpected options: %+v", opts)
+	}
+	for _, raw := range []map[string]string{
+		{"mode": "rwx"}, {"scope": "node"}, {"size": "1MiB"}, {"size": "68157441"},
+		{"filesystem": "xfs"}, {"durability": "maybe"}, {"class": "fuse"}, {"bogus": "1"}, {"mode": "ro", "seed": "/x"},
+	} {
+		if _, err := ParseVolumeOptions(raw); err == nil {
+			t.Fatalf("accepted invalid options %v", raw)
+		}
 	}
 }

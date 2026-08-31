@@ -10,7 +10,7 @@ import (
 func main() {
 	root := &cobra.Command{
 		Use:           "satchel",
-		Short:         "Portable Docker volumes backed by SQLite + Litestream",
+		Short:         "Portable Docker block volumes replicated to S3",
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
