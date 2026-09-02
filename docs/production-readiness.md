@@ -69,6 +69,46 @@ lease TTL, which is inherent to single-writer fencing. Operators raise
 lost-ack edge case (a state PUT that commits but loses its acknowledgement) is
 also fixed — see Track D.
 
+## Finding from provider testing: publishes could commit manifests that were stored nowhere
+
+Running the fault campaign against Cloudflare R2 surfaced the most serious bug
+found so far — and it is not an R2 bug. `publishPrepared` decides where a
+manifest body lives: embedded in `state.json`, archived as its own object, or
+(implicitly) in the attached bundle. When a manifest small enough to embed
+arrived while a ready background bundle was attached and the remaining inline
+area still exceeded the 64 KiB state limit, no placement branch fired: the
+commit advanced the head with a manifest key whose body existed **nowhere**.
+`TestPublishNeverCommitsUnstoredManifestBody` reproduces it deterministically
+on the in-memory store with zero fault injection — an ordinary publish under
+ordinary load-shape conditions.
+
+The damage is silent. Head restores keep working as long as newer writes shadow
+the dangling references, so the harness's per-cycle verification passed for
+hundreds of cycles while history rotted underneath: the R2 campaign volume lost
+generation 75's manifest (and with it a 123-block inline segment still
+referenced by two later checkpoints, which is what finally broke a remount),
+and a metadata scan of the local MinIO longhaul volume found **1,105 lost
+manifests across 20,437 generations**. Higher S3 latency widens the window
+(the background bundler falls behind the commit rate, growing the inline area),
+which is why R2 hit it in one cycle — but the mechanism is provider-independent.
+
+The fix is a placement invariant: if a manifest is neither embedded nor covered
+by the attached bundle, it is archived as its own object, unconditionally. Data
+already lost to the bug is not recoverable (the bodies were never written);
+affected volumes need to be rebuilt from a source of truth. Two lessons feed the
+roadmap: restore-path errors of the form "read inline segment manifest … not
+found" indicate this damage, and campaign verification must include full
+metadata reachability, not just head restores — hence `vol verify` below.
+
+Two smaller fixes came out of the same session: restore now resolves
+inline-segment sources through the current inline area and the whole bundle
+chain rather than only the location recorded at publish time
+(`manifestSourceLoader.resolve`, covered by
+`TestRestoreResolvesInlineSourceRolledIntoBundle` and
+`TestRestoreResolvesBundleOnlySourceWithoutBundleRef`), and garbage collection
+keeps the bundle-chain path down to any bundle that holds a referenced
+inline-segment source, so a sweep cannot strand such references.
+
 ## Track A — Destructive fault injection
 
 Goal: a repeatable campaign that kills every component at every point and
@@ -99,9 +139,19 @@ Exit criteria:
   `gc-kill` (kill -9 the collector mid-delete with zero grace, then prove the
   volume mounts, verifies, and a rerun collects to completion). The lost-ack
   path (a state PUT that commits but drops its acknowledgement) is covered at
-  the unit level by the Track D fix. Still to add: partial/torn S3 writes via a
-  proxy that drops the connection mid-body, clock skew across takeover, and a
-  real host reboot (`echo b > /proc/sysrq-trigger`) rather than a process kill.
+  the unit level by the Track D fix, and end-to-end by the `s3-chaos` fault:
+  `test/fault/chaosproxy` is a TCP proxy between Satchel and S3 that drops
+  connections mid-body in both directions (a torn request, and the nastier
+  torn response where the PUT committed but the acknowledgement was lost);
+  validation cycles survived without fencing — commits stalled and resumed —
+  with every check green. A real host reboot is covered by
+  `test/fault/reboot.sh`: phase one runs load and triggers a sysrq-b hard reset
+  with an fsynced acked-commit ledger on the host disk, phase two verifies
+  after boot. The first real cycle recorded 143 fsynced acked commits before
+  the reset and found all 143 after remount, with consistency and `pg_amcheck`
+  clean (note the bench host's MinIO also survives the reset; against real S3
+  the provider's durability is not a variable). Still to add: clock skew
+  across takeover.
 - The `gc-kill` seam found its first real bug. An interrupted sweep deletes
   point-in-time manifests in unordered fashion, and the history walk only
   tolerated a missing manifest directly under a checkpoint (the invariant a
@@ -128,7 +178,11 @@ Exit criteria:
   stalled fsync returns `EIO` instead of a false ack, and node B takes over
   after expiry. In both, the durable state afterward contains only the
   legitimate writes and the superseded node's post-partition write is absent.
-  Still to add: a concurrent (not operator- or partition-driven) mount race.
+  The concurrent mount race is covered by
+  `TestSimultaneousMountRaceAdmitsExactlyOneWriter`: two nodes race the
+  volume-creating mount (the conditional create admits exactly one; the loser's
+  retry is refused while the lease is held) and, after a clean release, two
+  nodes race takeover with the same exactly-one outcome.
 - Every failure preserved with its goroutine dump, satchel log, and postgres
   log for triage.
 
@@ -152,15 +206,20 @@ violations.
 
 ## Track C — Real provider coverage
 
-Every result so far is loopback MinIO on the same disk as the database, which is
-optimistic on network latency and pessimistic on disk contention — neither
-matches production. Remote durability's latency is dominated by S3 request time,
-so provider behavior is the single biggest unknown in the performance story.
+Cloudflare R2 coverage started 2026-09-02 against a bucket ~13 ms from the
+bench host (~135 Mbps up). Done so far: `VerifyConditionalWrites` passes on R2
+(`If-Match`/`If-None-Match` semantics hold — the fence works), and the full
+four-test e2e suite passes against R2, including both takeover paths and the
+mount race. The e2e suite's S3 target is now configurable
+(`SATCHEL_E2E_S3_BUCKET`/`REGION`/`ACCESS_KEY`/`SECRET_KEY`). R2's higher
+latency immediately earned its keep: it widened a race that exposed the
+unstored-manifest bug above, and exposed a test brittleness (the operator-break
+e2e now quiesces the holder's trailing checkpoint before breaking, matching the
+documented operator procedure). A fault campaign and a remote-durability
+pgbench comparison (same host, MinIO vs R2) run with the fixed binary.
 
-- Run the full benchmark and a fault campaign against real AWS S3 (same region
-  as the compute), and against at least one S3-compatible alternative
-  (Cloudflare R2, Backblaze B2, or GCS with the S3 shim) to shake out
-  conditional-request semantics beyond MinIO.
+- Still to run: real AWS S3 (same region as compute) with the same battery, to
+  shake out a third implementation's conditional-write and latency behavior.
 - Confirm `If-Match`/`If-None-Match` behave identically — the fence depends on
   it, and providers vary in strong-consistency and conditional-write guarantees.
 - Record p50/p95/**p99** commit latency per provider; size the product against

@@ -24,6 +24,7 @@ func newVolCommand() *cobra.Command {
 	cmd.AddCommand(
 		newVolListCommand(&opts),
 		newVolInspectCommand(&opts),
+		newVolVerifyCommand(&opts),
 		newVolRestoreCommand(&opts),
 		newVolRemoveCommand(&opts),
 		newVolGCCommand(&opts),
@@ -130,6 +131,44 @@ func newVolInspectCommand(opts *objectstore.S3Config) *cobra.Command {
 			return nil
 		},
 	}
+}
+
+func newVolVerifyCommand(opts *objectstore.S3Config) *cobra.Command {
+	var deep bool
+	cmd := &cobra.Command{
+		Use:   "verify <volume>",
+		Short: "Check remote metadata integrity without modifying anything",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			remote, err := buildRemote(*opts)
+			if err != nil {
+				return err
+			}
+			state, _, err := remote.Inspect(cmd.Context(), args[0])
+			if err != nil {
+				return err
+			}
+			report, err := remote.VerifyMetadataWithOptions(cmd.Context(), state, replica.VerifyOptions{Deep: deep})
+			if err != nil {
+				return err
+			}
+			out := cmd.OutOrStdout()
+			fmt.Fprintf(out, "manifests: %d\nbundles: %d\nrefs checked: %d\nexternal objects: %d\nbytes fetched: %d\n",
+				report.Manifests, report.Bundles, report.RefsChecked, report.ExternalObjects, report.BytesFetched)
+			if report.TruncatedBelowCheckpoint {
+				fmt.Fprintf(out, "history truncated below checkpoint at generation %d\n", report.OldestGeneration)
+			}
+			for _, problem := range report.Problems {
+				fmt.Fprintln(out, problem)
+			}
+			if len(report.Problems) > 0 {
+				return fmt.Errorf("found %d metadata problems", len(report.Problems))
+			}
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&deep, "deep", false, "fetch external segments and verify content hashes")
+	return cmd
 }
 
 func newVolRestoreCommand(opts *objectstore.S3Config) *cobra.Command {

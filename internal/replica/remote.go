@@ -707,6 +707,13 @@ func (l *Lease) publishPrepared(
 			archiveCurrent = true
 		}
 	}
+	// Every published manifest body must be durable somewhere: embedded in
+	// state.json, archived as its own object, or already part of the attached
+	// bundle. A ready background bundle that leaves too little inline room used
+	// to fall through with neither, committing a manifest key with no body.
+	if !embed && !archiveCurrent {
+		archiveCurrent = true
+	}
 
 	uploadCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -1489,6 +1496,7 @@ func (r *Remote) collectGarbage(ctx context.Context, state State, opts GCOptions
 		return GCResult{}, err
 	}
 	keep := map[string]struct{}{}
+	sources := newManifestSourceLoader(r.Store, state)
 	if len(history) > 0 {
 		keepThrough := len(history) - 1
 		cutoff := r.now().Add(-opts.HistoryRetention)
@@ -1514,6 +1522,15 @@ func (r *Remote) collectGarbage(ctx context.Context, state State, opts GCOptions
 				}
 				if ref.SourceBundle != "" {
 					keep[ref.SourceBundle] = struct{}{}
+				}
+				if ref.SourceManifest != "" && ref.SourceBundle == "" && len(ref.InlineData) == 0 {
+					path, err := sources.findBundlePath(ctx, ref.SourceManifest)
+					if err != nil {
+						return GCResult{}, fmt.Errorf("locate inline segment source %s: %w", ref.SourceManifest, err)
+					}
+					for _, bundleKey := range path {
+						keep[bundleKey] = struct{}{}
+					}
 				}
 			}
 		}
@@ -1682,34 +1699,49 @@ func createSparseImage(path string, size int64) (*os.File, error) {
 type manifestSourceLoader struct {
 	store    objectstore.Store
 	volumeID string
+	inline   map[string]json.RawMessage
+	head     *ManifestBundleRef
 	mu       sync.Mutex
 	bundles  map[string]manifestBundle
 }
 
-func newManifestSourceLoader(store objectstore.Store, volumeID string) *manifestSourceLoader {
-	return &manifestSourceLoader{store: store, volumeID: volumeID, bundles: make(map[string]manifestBundle)}
+func newManifestSourceLoader(store objectstore.Store, state State) *manifestSourceLoader {
+	return &manifestSourceLoader{
+		store: store, volumeID: state.ID,
+		inline: state.InlineManifests, head: state.ManifestBundle,
+		bundles: make(map[string]manifestBundle),
+	}
+}
+
+func (l *manifestSourceLoader) loadBundleLocked(ctx context.Context, bundleKey string) (manifestBundle, error) {
+	bundle, ok := l.bundles[bundleKey]
+	if ok {
+		return bundle, nil
+	}
+	obj, err := l.store.Get(ctx, bundleKey)
+	if err != nil {
+		return manifestBundle{}, fmt.Errorf("read manifest bundle %s: %w", bundleKey, err)
+	}
+	digest := sha256.Sum256(obj.Data)
+	if !strings.HasSuffix(bundleKey, "/manifest-bundles/"+hex.EncodeToString(digest[:])+".json") {
+		return manifestBundle{}, fmt.Errorf("manifest bundle %s checksum mismatch", bundleKey)
+	}
+	if err := json.Unmarshal(obj.Data, &bundle); err != nil {
+		return manifestBundle{}, fmt.Errorf("decode manifest bundle %s: %w", bundleKey, err)
+	}
+	if bundle.Format != Format || bundle.VolumeID != l.volumeID || len(bundle.Manifests) == 0 {
+		return manifestBundle{}, fmt.Errorf("invalid manifest bundle %s", bundleKey)
+	}
+	l.bundles[bundleKey] = bundle
+	return bundle, nil
 }
 
 func (l *manifestSourceLoader) manifestBody(ctx context.Context, bundleKey, manifestKey string) ([]byte, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	bundle, ok := l.bundles[bundleKey]
-	if !ok {
-		obj, err := l.store.Get(ctx, bundleKey)
-		if err != nil {
-			return nil, fmt.Errorf("read manifest bundle %s: %w", bundleKey, err)
-		}
-		digest := sha256.Sum256(obj.Data)
-		if !strings.HasSuffix(bundleKey, "/manifest-bundles/"+hex.EncodeToString(digest[:])+".json") {
-			return nil, fmt.Errorf("manifest bundle %s checksum mismatch", bundleKey)
-		}
-		if err := json.Unmarshal(obj.Data, &bundle); err != nil {
-			return nil, fmt.Errorf("decode manifest bundle %s: %w", bundleKey, err)
-		}
-		if bundle.Format != Format || bundle.VolumeID != l.volumeID || len(bundle.Manifests) == 0 {
-			return nil, fmt.Errorf("invalid manifest bundle %s", bundleKey)
-		}
-		l.bundles[bundleKey] = bundle
+	bundle, err := l.loadBundleLocked(ctx, bundleKey)
+	if err != nil {
+		return nil, err
 	}
 	for _, entry := range bundle.Manifests {
 		if entry.Key == manifestKey {
@@ -1717,6 +1749,62 @@ func (l *manifestSourceLoader) manifestBody(ctx context.Context, bundleKey, mani
 		}
 	}
 	return nil, fmt.Errorf("manifest %s is absent from bundle %s", manifestKey, bundleKey)
+}
+
+// resolve finds a manifest body for a reference published without a bundle
+// location. The source was inline in state.json when the reference was
+// published, and later bundle rollovers may have moved it, so the search
+// covers the current inline area, the whole bundle chain, and finally a
+// standalone manifest object.
+func (l *manifestSourceLoader) resolve(ctx context.Context, manifestKey string) ([]byte, error) {
+	if body, ok := l.inline[manifestKey]; ok {
+		return body, nil
+	}
+	if body := l.searchBundleChain(ctx, manifestKey, nil); body != nil {
+		return body, nil
+	}
+	obj, err := l.store.Get(ctx, manifestKey)
+	if err != nil {
+		return nil, err
+	}
+	return obj.Data, nil
+}
+
+// findBundlePath returns the bundle-chain keys from the head down to and
+// including the bundle that holds manifestKey, so garbage collection can keep
+// the manifest reachable. It returns nil when the manifest is inline, is a
+// standalone object, or cannot be found.
+func (l *manifestSourceLoader) findBundlePath(ctx context.Context, manifestKey string) ([]string, error) {
+	if _, ok := l.inline[manifestKey]; ok {
+		return nil, nil
+	}
+	var path []string
+	if body := l.searchBundleChain(ctx, manifestKey, &path); body != nil {
+		return path, nil
+	}
+	return nil, nil
+}
+
+func (l *manifestSourceLoader) searchBundleChain(ctx context.Context, manifestKey string, path *[]string) []byte {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	ref := l.head
+	for ref != nil {
+		bundle, err := l.loadBundleLocked(ctx, ref.Key)
+		if err != nil {
+			return nil
+		}
+		if path != nil {
+			*path = append(*path, ref.Key)
+		}
+		for _, entry := range bundle.Manifests {
+			if entry.Key == manifestKey {
+				return entry.Body
+			}
+		}
+		ref = bundle.Parent
+	}
+	return nil
 }
 
 func applyObjectRef(
@@ -1735,9 +1823,7 @@ func applyObjectRef(
 		if ref.SourceBundle != "" {
 			sourceBody, err = sources.manifestBody(ctx, ref.SourceBundle, ref.SourceManifest)
 		} else {
-			var obj objectstore.Object
-			obj, err = store.Get(ctx, ref.SourceManifest)
-			sourceBody = obj.Data
+			sourceBody, err = sources.resolve(ctx, ref.SourceManifest)
 		}
 		if err != nil {
 			return fmt.Errorf("read inline segment manifest %s: %w", ref.SourceManifest, err)
@@ -1784,10 +1870,10 @@ func applyObjectRef(
 	return nil
 }
 
-func applyObjectRefs(ctx context.Context, store objectstore.Store, volumeID string, f *os.File, size int64, refs []ObjectRef) error {
+func applyObjectRefs(ctx context.Context, store objectstore.Store, state State, f *os.File, size int64, refs []ObjectRef) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	sources := newManifestSourceLoader(store, volumeID)
+	sources := newManifestSourceLoader(store, state)
 	jobs := make(chan ObjectRef)
 	var firstErr error
 	var errOnce sync.Once
@@ -1836,7 +1922,7 @@ func (r *Remote) RestoreState(ctx context.Context, state State, path string) err
 		return err
 	}
 	defer f.Close()
-	return applyObjectRefs(ctx, r.Store, state.ID, f, state.Size, refs)
+	return applyObjectRefs(ctx, r.Store, state, f, state.Size, refs)
 }
 
 func (r *Remote) Exists(ctx context.Context, name string) (bool, error) {

@@ -22,6 +22,24 @@ import (
 	"github.com/zephyraoss/satchel/internal/replica"
 )
 
+func e2eEnvOr(name, fallback string) string {
+	if value := os.Getenv(name); value != "" {
+		return value
+	}
+	return fallback
+}
+
+func e2eS3Config(endpoint string) objectstore.S3Config {
+	return objectstore.S3Config{
+		Endpoint:       endpoint,
+		Region:         e2eEnvOr("SATCHEL_E2E_S3_REGION", "us-east-1"),
+		Bucket:         e2eEnvOr("SATCHEL_E2E_S3_BUCKET", "satchel"),
+		AccessKeyID:    e2eEnvOr("SATCHEL_E2E_S3_ACCESS_KEY", "minioadmin"),
+		SecretKey:      e2eEnvOr("SATCHEL_E2E_S3_SECRET_KEY", "minioadmin"),
+		ForcePathStyle: true,
+	}
+}
+
 func TestVolumeMovesBetweenNodes(t *testing.T) {
 	endpoint := os.Getenv("SATCHEL_E2E_S3_ENDPOINT")
 	if endpoint == "" {
@@ -36,10 +54,7 @@ func TestVolumeMovesBetweenNodes(t *testing.T) {
 	if _, err := os.Stat("/dev/nbd0"); err != nil {
 		t.Skip("load the nbd kernel module before running")
 	}
-	cfg := objectstore.S3Config{
-		Endpoint: endpoint, Region: "us-east-1", Bucket: "satchel",
-		AccessKeyID: "minioadmin", SecretKey: "minioadmin", ForcePathStyle: true,
-	}
+	cfg := e2eS3Config(endpoint)
 	store := objectstore.NewS3(cfg)
 	if err := objectstore.VerifyConditionalWrites(context.Background(), store); err != nil {
 		t.Fatal(err)
@@ -161,10 +176,7 @@ func TestConcurrentWriterIsFencedAfterTakeover(t *testing.T) {
 	if _, err := os.Stat("/dev/nbd0"); err != nil {
 		t.Skip("load the nbd kernel module before running")
 	}
-	cfg := objectstore.S3Config{
-		Endpoint: endpoint, Region: "us-east-1", Bucket: "satchel",
-		AccessKeyID: "minioadmin", SecretKey: "minioadmin", ForcePathStyle: true,
-	}
+	cfg := e2eS3Config(endpoint)
 	store := objectstore.NewS3(cfg)
 	if err := objectstore.VerifyConditionalWrites(context.Background(), store); err != nil {
 		t.Fatal(err)
@@ -206,6 +218,20 @@ func TestConcurrentWriterIsFencedAfterTakeover(t *testing.T) {
 	}
 	if held.Generation < 2 || held.Lease == nil {
 		t.Fatalf("node A did not publish under a held lease: %+v", held)
+	}
+
+	// Wait out node A's trailing async checkpoint so the conditional break does
+	// not race a concurrent state update; operators are likewise told to
+	// quiesce the holder before breaking its lease.
+	deadline := time.Now().Add(30 * time.Second)
+	for held.Checkpoint < held.Generation {
+		if time.Now().After(deadline) {
+			t.Fatalf("node A never quiesced: %+v", held)
+		}
+		time.Sleep(200 * time.Millisecond)
+		if held, _, err = inspect.Inspect(ctx, name); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	// Operator fences node A and hands the volume to node B.
@@ -338,10 +364,7 @@ func TestPartitionedWriterSelfFencesAndYields(t *testing.T) {
 	if _, err := os.Stat("/dev/nbd0"); err != nil {
 		t.Skip("load the nbd kernel module before running")
 	}
-	cfg := objectstore.S3Config{
-		Endpoint: endpoint, Region: "us-east-1", Bucket: "satchel",
-		AccessKeyID: "minioadmin", SecretKey: "minioadmin", ForcePathStyle: true,
-	}
+	cfg := e2eS3Config(endpoint)
 	rawStore := objectstore.NewS3(cfg)
 	if err := objectstore.VerifyConditionalWrites(context.Background(), rawStore); err != nil {
 		t.Fatal(err)
@@ -473,4 +496,114 @@ func mountAndCheck(t *testing.T, image string, want map[string]string) error {
 		}
 	}
 	return nil
+}
+
+func TestSimultaneousMountRaceAdmitsExactlyOneWriter(t *testing.T) {
+	endpoint := os.Getenv("SATCHEL_E2E_S3_ENDPOINT")
+	if endpoint == "" {
+		t.Skip("set SATCHEL_E2E_S3_ENDPOINT to run")
+	}
+	if os.Geteuid() != 0 {
+		t.Skip("NBD mount test requires root")
+	}
+	if _, err := exec.LookPath("mkfs.ext4"); err != nil {
+		t.Skip("mkfs.ext4 is not installed")
+	}
+	if _, err := os.Stat("/dev/nbd0"); err != nil {
+		t.Skip("load the nbd kernel module before running")
+	}
+	cfg := e2eS3Config(endpoint)
+	store := objectstore.NewS3(cfg)
+	if err := objectstore.VerifyConditionalWrites(context.Background(), store); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	name := "race-" + time.Now().Format("150405.000000000")
+	t.Cleanup(func() { _ = store.DeletePrefix(ctx, replica.VolumePrefix(name)) })
+
+	node := func(id string) *plugin.Driver {
+		driver, err := plugin.New(
+			plugin.Config{NodeID: id, StateDir: filepath.Join(t.TempDir(), id), CheckpointInterval: 1, SyncInterval: time.Hour},
+			&replica.Remote{Store: store, TTL: 10 * time.Second},
+			block.New(block.Options{}),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return driver
+	}
+
+	raceMounts := func(drivers map[string]*plugin.Driver) (string, *volume.MountResponse) {
+		t.Helper()
+		type outcome struct {
+			id       string
+			response *volume.MountResponse
+			err      error
+		}
+		results := make(chan outcome, len(drivers))
+		gate := make(chan struct{})
+		for id, driver := range drivers {
+			go func() {
+				<-gate
+				response, err := driver.Mount(&volume.MountRequest{Name: name, ID: id})
+				results <- outcome{id: id, response: response, err: err}
+			}()
+		}
+		close(gate)
+		winner := ""
+		var mounted *volume.MountResponse
+		for range drivers {
+			result := <-results
+			if result.err == nil {
+				if winner != "" {
+					t.Fatalf("both racing nodes mounted the same volume: %s and %s", winner, result.id)
+				}
+				winner, mounted = result.id, result.response
+				continue
+			}
+			t.Logf("loser %s rejected: %v", result.id, result.err)
+		}
+		if winner == "" {
+			t.Fatal("no racing node acquired the volume")
+		}
+		return winner, mounted
+	}
+
+	nodeA, nodeB := node("node-a"), node("node-b")
+	for id, driver := range map[string]*plugin.Driver{"node-a": nodeA, "node-b": nodeB} {
+		if err := driver.Create(&volume.CreateRequest{Name: name, Options: map[string]string{"size": "64MiB"}}); err != nil {
+			t.Fatalf("create on %s: %v", id, err)
+		}
+	}
+	drivers := map[string]*plugin.Driver{"node-a": nodeA, "node-b": nodeB}
+	winner, mounted := raceMounts(drivers)
+	t.Logf("creation race winner: %s", winner)
+
+	loser := "node-a"
+	if winner == "node-a" {
+		loser = "node-b"
+	}
+	if _, err := drivers[loser].Mount(&volume.MountRequest{Name: name, ID: loser}); err == nil {
+		t.Fatal("loser mounted while the winner holds the lease")
+	} else if !strings.Contains(err.Error(), "is held by") {
+		t.Fatalf("loser retry error = %v, want a held-lease rejection", err)
+	}
+	if err := writeThenSync(filepath.Join(mounted.Mountpoint, "owner"), []byte(winner)); err != nil {
+		t.Fatal(err)
+	}
+	if err := drivers[winner].Unmount(&volume.UnmountRequest{Name: name, ID: winner}); err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+
+	nodeC := node("node-c")
+	takeoverDrivers := map[string]*plugin.Driver{loser: drivers[loser], "node-c": nodeC}
+	second, mounted := raceMounts(takeoverDrivers)
+	t.Logf("takeover race winner: %s", second)
+	data, err := os.ReadFile(filepath.Join(mounted.Mountpoint, "owner"))
+	if err != nil || string(data) != winner {
+		t.Fatalf("takeover winner read %q, err=%v, want %q", data, err, winner)
+	}
+	if err := takeoverDrivers[second].Unmount(&volume.UnmountRequest{Name: name, ID: second}); err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
 }

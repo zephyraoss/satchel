@@ -46,7 +46,7 @@ func (r *Remote) PrepareLazyRestore(ctx context.Context, state State, path strin
 	}
 	readCtx, cancel := context.WithCancel(context.Background())
 	lazy := &LazyImage{
-		store: r.Store, manifests: newManifestSourceLoader(r.Store, state.ID), file: f, size: state.Size, refs: refs,
+		store: r.Store, manifests: newManifestSourceLoader(r.Store, state), file: f, size: state.Size, refs: refs,
 		loaded: make([]bool, len(refs)), ctx: readCtx, cancel: cancel,
 	}
 	for refIndex, ref := range refs {

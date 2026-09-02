@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -1832,5 +1833,232 @@ func TestHistoryFailsOnMissingManifestAboveNewestCheckpoint(t *testing.T) {
 	}
 	if _, err := remote.loadHistory(ctx, lease.State()); !errors.Is(err, objectstore.ErrNotFound) {
 		t.Fatalf("missing restorable-chain manifest must fail the walk, got: %v", err)
+	}
+}
+
+func TestRestoreResolvesInlineSourceRolledIntoBundle(t *testing.T) {
+	ctx := context.Background()
+	store := objectstore.NewMemory()
+	remote := &Remote{Store: store}
+	lease, _, err := remote.Acquire(ctx, "rolled-source", "node-a", CreateOptions{Size: 4096 * DefaultBlockSize})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 40; i++ {
+		segment, err := EncodeSegment(&Generation{Blocks: map[uint64][]byte{1: bytes.Repeat([]byte{byte(i)}, DefaultBlockSize)}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := lease.Publish(ctx, segment); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sourceKey := lease.State().Manifest
+	if err := lease.PublishCheckpoint(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	fillerBlocks := make(map[uint64][]byte)
+	for block := uint64(200); block < 300; block++ {
+		fillerBlocks[block] = bytes.Repeat([]byte{'f'}, DefaultBlockSize)
+	}
+	filler, err := EncodeSegment(&Generation{Blocks: fillerBlocks})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 64 {
+		if err := lease.Publish(ctx, filler); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	state := lease.State()
+	if _, ok := state.InlineManifests[sourceKey]; ok {
+		t.Fatal("source manifest is still inline; the reference cannot go stale")
+	}
+	if _, err := store.Get(ctx, sourceKey); err == nil {
+		t.Fatal("source manifest exists as an object; the reference cannot go stale")
+	}
+
+	verify := func(stage string) {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "restored")
+		if _, err := remote.Restore(ctx, "rolled-source", path); err != nil {
+			t.Fatalf("%s: restore lost an inline segment source: %v", stage, err)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if data[DefaultBlockSize] != 40 {
+			t.Fatalf("%s: block 1 = %d, want newest pre-checkpoint write", stage, data[DefaultBlockSize])
+		}
+		if data[200*DefaultBlockSize] != 'f' {
+			t.Fatalf("%s: filler block lost", stage)
+		}
+	}
+	verify("after bundle rollover")
+
+	for range 2 {
+		if _, err := lease.CollectGarbage(ctx, GCOptions{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	verify("after two garbage collection passes")
+}
+
+func TestRestoreResolvesBundleOnlySourceWithoutBundleRef(t *testing.T) {
+	ctx := context.Background()
+	store := objectstore.NewMemory()
+	remote := &Remote{Store: store}
+
+	state := State{
+		Format: Format, ID: "vol-id", Name: "stale-ref", Size: 64 * DefaultBlockSize,
+		BlockSize: DefaultBlockSize, Filesystem: "ext4", Epoch: 1,
+	}
+	segment, err := EncodeSegment(&Generation{Blocks: map[uint64][]byte{3: bytes.Repeat([]byte{'d'}, DefaultBlockSize)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inlineRef := segmentReference(state, segment)
+	if len(inlineRef.InlineData) == 0 {
+		t.Fatal("segment did not inline")
+	}
+	source := Manifest{
+		Format: Format, VolumeID: state.ID, Generation: 1, Epoch: 1, Kind: "delta",
+		Segments: []ObjectRef{inlineRef}, CreatedAt: time.Now().UTC(),
+	}
+	preparedSource, err := prepareManifest(state, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	bundle := manifestBundle{
+		Format: Format, VolumeID: state.ID, FirstGeneration: 1, LastGeneration: 1,
+		Manifests: []bundledManifest{{Key: preparedSource.key, Body: preparedSource.body}},
+	}
+	bundleBody, err := json.Marshal(bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundleDigest := sha256.Sum256(bundleBody)
+	bundleKey := VolumePrefix(state.Name) + "manifest-bundles/" + hex.EncodeToString(bundleDigest[:]) + ".json"
+	if _, err := store.PutIfAbsent(ctx, bundleKey, bundleBody); err != nil {
+		t.Fatal(err)
+	}
+
+	staleRef := inlineRef
+	staleRef.InlineData = nil
+	staleRef.SourceManifest = preparedSource.key
+	staleRef.SourceIndex = 0
+	stateAtCheckpoint := state
+	stateAtCheckpoint.Generation = 1
+	checkpoint := Manifest{
+		Format: Format, VolumeID: state.ID, Generation: 2, Epoch: 1, Kind: "checkpoint",
+		Parent: preparedSource.key, Segments: []ObjectRef{staleRef}, CreatedAt: time.Now().UTC(),
+	}
+	preparedCheckpoint, err := prepareManifest(stateAtCheckpoint, checkpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.PutIfAbsent(ctx, preparedCheckpoint.key, preparedCheckpoint.body); err != nil {
+		t.Fatal(err)
+	}
+
+	state.Generation = 2
+	state.Checkpoint = 2
+	state.Manifest = preparedCheckpoint.key
+	state.ManifestBundle = &ManifestBundleRef{Key: bundleKey, FirstGeneration: 1, LastGeneration: 1}
+
+	path := filepath.Join(t.TempDir(), "restored")
+	if err := remote.RestoreState(ctx, state, path); err != nil {
+		t.Fatalf("restore could not resolve a bundle-only source manifest: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if data[3*DefaultBlockSize] != 'd' {
+		t.Fatal("restored block lost its inline segment data")
+	}
+}
+
+func TestPublishNeverCommitsUnstoredManifestBody(t *testing.T) {
+	ctx := context.Background()
+	store := objectstore.NewMemory()
+	remote := &Remote{Store: store}
+	const bigExtents = 1400
+	lease, _, err := remote.Acquire(ctx, "dangling", "node-a", CreateOptions{Size: 4 * bigExtents * DefaultBlockSize})
+	if err != nil {
+		t.Fatal(err)
+	}
+	small := func(start uint64, extents int) Segment {
+		blocks := make(map[uint64][]byte)
+		for i := range extents {
+			blocks[start+uint64(i)*2] = bytes.Repeat([]byte{'s'}, DefaultBlockSize)
+		}
+		segment, err := EncodeSegment(&Generation{Blocks: blocks})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return segment
+	}
+	for i := range 3 {
+		if err := lease.Publish(ctx, small(uint64(3000+i*100), 40)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	earlier := lease.State()
+	injected, err := prepareManifestBundle(earlier)
+	if err != nil || injected == nil {
+		t.Fatalf("bundle: %v %v", injected, err)
+	}
+	for i := range 4 {
+		if err := lease.Publish(ctx, small(uint64(4000+i*100), 40)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.PutIfAbsent(ctx, injected.ref.Key, injected.body); err != nil {
+		t.Fatal(err)
+	}
+	injected.uploaded = true
+	lease.mu.Lock()
+	if !manifestBundleApplies(lease.state, injected) {
+		lease.mu.Unlock()
+		t.Fatal("injected ready bundle does not apply; adjust the setup")
+	}
+	lease.readyBundle = injected
+	remaining := inlineManifestBytesAfterBundle(lease.state.InlineManifests, injected)
+	lease.mu.Unlock()
+
+	blocks := make(map[uint64][]byte)
+	for i := range bigExtents {
+		blocks[uint64(i*2)] = bytes.Repeat([]byte{'b'}, DefaultBlockSize)
+	}
+	big, err := EncodeSegment(&Generation{Blocks: blocks})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lease.Publish(ctx, big); err != nil {
+		t.Fatal(err)
+	}
+
+	state := lease.State()
+	headBody := len(state.InlineManifests[state.Manifest])
+	if headBody == 0 {
+		if _, err := store.Get(ctx, state.Manifest); err != nil {
+			t.Fatalf("published head manifest %s is neither inline nor stored (remaining inline was %d): %v", state.Manifest, remaining, err)
+		}
+	}
+	path := filepath.Join(t.TempDir(), "restored")
+	if _, err := remote.Restore(ctx, "dangling", path); err != nil {
+		t.Fatalf("restore failed after publish: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if data[0] != 'b' {
+		t.Fatal("restored image lost the large generation")
 	}
 }

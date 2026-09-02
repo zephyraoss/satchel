@@ -15,12 +15,13 @@ CYCLES=${1:-8}
 : "${SATCHEL_FAULT_VOLUME_SIZE:=8GiB}"
 : "${SATCHEL_FAULT_LOAD_MIN_SECONDS:=8}"
 : "${SATCHEL_FAULT_LOAD_MAX_SECONDS:=25}"
-: "${SATCHEL_FAULT_FAULTS:=pg satchel-break satchel-ttl s3-outage satchel-checkpoint satchel-upload gc-kill}"
+: "${SATCHEL_FAULT_FAULTS:=pg satchel-break satchel-ttl s3-outage satchel-checkpoint satchel-upload gc-kill s3-chaos}"
 : "${SATCHEL_FAULT_S3_OUTAGE_SECONDS:=30}"
 : "${SATCHEL_FAULT_S3_STOP:=systemctl stop minio}"
 : "${SATCHEL_FAULT_S3_START:=systemctl start minio}"
 : "${SATCHEL_FAULT_LEASE_TTL_WAIT:=40}"
 : "${SATCHEL_FAULT_GC_EVERY:=10}"
+: "${SATCHEL_FAULT_VERIFY_EVERY:=5}"
 : "${SATCHEL_FAULT_START_TIMEOUT:=300}"
 : "${SATCHEL_FAULT_MOUNT_TIMEOUT:=300}"
 : "${SATCHEL_SYNC_INTERVAL:=1s}"
@@ -29,11 +30,17 @@ CYCLES=${1:-8}
 : "${SATCHEL_FAULT_CHECKPOINT_FAST_INTERVAL:=1}"
 : "${SATCHEL_FAULT_UPLOAD_BURST_MIB:=256}"
 : "${SATCHEL_FAULT_GC_GRACE:=0s}"
+: "${SATCHEL_FAULT_CHAOS_ADDR:=127.0.0.1:19999}"
+: "${SATCHEL_FAULT_CHAOS_SECONDS:=20}"
+: "${SATCHEL_FAULT_CHAOSPROXY_BIN:=./chaosproxy}"
+: "${SATCHEL_FAULT_KEEP_STATE:=0}"
+
+: "${SATCHEL_FAULT_PG_PORT:=55433}"
 
 run_root="$SATCHEL_FAULT_ROOT/$SATCHEL_FAULT_RUN_ID"
 volume=$SATCHEL_FAULT_VOLUME
 socket_dir="$run_root/socket"
-port=55433
+port=$SATCHEL_FAULT_PG_PORT
 satchel_pid=
 mountpoint=
 pgdata=
@@ -43,6 +50,8 @@ pg_running=0
 load_pids=()
 burst_pid=
 gc_pid=
+proxy_pid=
+satchel_mount_endpoint=
 
 if [[ -e "$run_root" ]]; then
   echo "fault campaign already exists: $SATCHEL_FAULT_RUN_ID" >&2
@@ -86,7 +95,7 @@ start_satchel() {
   local checkpoint_interval=${3:-$SATCHEL_CHECKPOINT_INTERVAL}
   install -d -m 0700 "$state_dir"
   env \
-    SATCHEL_S3_ENDPOINT="$SATCHEL_S3_ENDPOINT" \
+    SATCHEL_S3_ENDPOINT="${satchel_mount_endpoint:-$SATCHEL_S3_ENDPOINT}" \
     SATCHEL_S3_BUCKET="$SATCHEL_S3_BUCKET" \
     SATCHEL_S3_ACCESS_KEY="$SATCHEL_S3_ACCESS_KEY" \
     SATCHEL_S3_SECRET_KEY="$SATCHEL_S3_SECRET_KEY" \
@@ -219,7 +228,7 @@ stop_load() {
     wait "$pid" 2>/dev/null || true
   done
   load_pids=()
-  pkill -9 -f "pgbench .*-p $port .*fault" 2>/dev/null || true
+  pkill -9 -f "pgbench -h $socket_dir " 2>/dev/null || true
   pkill -9 -f "psql -h $socket_dir" 2>/dev/null || true
 }
 
@@ -272,12 +281,49 @@ initialize_database() {
   psqlc "CREATE TABLE ledger (seq bigint PRIMARY KEY)" >/dev/null
 }
 
+start_chaos_proxy() {
+  local cycle_dir=$1
+  if [[ ! -x "$SATCHEL_FAULT_CHAOSPROXY_BIN" ]]; then
+    go build -o "$SATCHEL_FAULT_CHAOSPROXY_BIN" ./test/fault/chaosproxy || fail "chaosproxy build failed"
+  fi
+  "$SATCHEL_FAULT_CHAOSPROXY_BIN" \
+    -listen "$SATCHEL_FAULT_CHAOS_ADDR" \
+    -target "${SATCHEL_S3_ENDPOINT#http://}" \
+    -chaos-file "$cycle_dir/chaos-on" >"$cycle_dir/chaosproxy.log" 2>&1 &
+  proxy_pid=$!
+  sleep 0.3
+  kill -0 "$proxy_pid" 2>/dev/null || fail "chaosproxy did not start, see $cycle_dir/chaosproxy.log"
+  satchel_mount_endpoint="http://$SATCHEL_FAULT_CHAOS_ADDR"
+}
+
+stop_chaos_proxy() {
+  if [[ -n "$proxy_pid" ]]; then
+    kill -9 "$proxy_pid" 2>/dev/null || true
+    wait "$proxy_pid" 2>/dev/null || true
+  fi
+  proxy_pid=
+  satchel_mount_endpoint=
+}
+
+cleanup_cycle_state() {
+  if [[ "$SATCHEL_FAULT_KEEP_STATE" == 1 ]]; then
+    return 0
+  fi
+  local dir
+  for dir in "$cycle_dir/state" "$cycle_dir/takeover-state" "$cycle_dir/verify-state"; do
+    if [[ -d "$dir" ]]; then
+      rm -rf "$dir"
+    fi
+  done
+}
+
 cleanup() {
   stop_load
   if [[ -n "$burst_pid" ]]; then kill -9 "$burst_pid" 2>/dev/null || true; fi
   if [[ -n "$gc_pid" ]]; then kill -9 "$gc_pid" 2>/dev/null || true; fi
   stop_postgres_clean
   stop_satchel_clean
+  stop_chaos_proxy
 }
 trap cleanup EXIT
 
@@ -294,6 +340,9 @@ for ((cycle = 1; cycle <= CYCLES; cycle++)); do
   mount_checkpoint_interval=$SATCHEL_CHECKPOINT_INTERVAL
   if [[ "$fault" == satchel-checkpoint ]]; then
     mount_checkpoint_interval=$SATCHEL_FAULT_CHECKPOINT_FAST_INTERVAL
+  fi
+  if [[ "$fault" == s3-chaos ]]; then
+    start_chaos_proxy "$cycle_dir"
   fi
   start_satchel "$cycle_dir/state" "$cycle_dir/satchel.log" "$mount_checkpoint_interval" || \
     fail "mount failed, see $cycle_dir/satchel.log"
@@ -417,6 +466,35 @@ for ((cycle = 1; cycle <= CYCLES; cycle++)); do
       stop_postgres_clean
       stop_satchel_clean
       ;;
+    s3-chaos)
+      log "dropping S3 connections mid-body for ${SATCHEL_FAULT_CHAOS_SECONDS}s"
+      touch "$cycle_dir/chaos-on"
+      sleep "$SATCHEL_FAULT_CHAOS_SECONDS"
+      rm -f "$cycle_dir/chaos-on"
+      sleep 10
+      if kill -0 "$satchel_pid" 2>/dev/null && kill -0 "$pg_pid" 2>/dev/null; then
+        log "survived torn-write chaos; commits stalled and resumed"
+        stop_load
+        stop_postgres_clean
+        stop_satchel_clean
+      else
+        log "writer fenced during chaos; verifying recovery"
+        stop_load
+        kill_postgres_hard
+        kill_satchel_hard
+        force_unmount
+      fi
+      stop_chaos_proxy
+      satchel_cmd "$SATCHEL_BIN" vol lease break --yes "$volume" >>"$cycle_dir/lease-break.log" 2>&1 || \
+        fail "lease break failed, see $cycle_dir/lease-break.log"
+      start_satchel "$cycle_dir/verify-state" "$cycle_dir/satchel-verify.log" || \
+        fail "post-chaos mount failed, see $cycle_dir/satchel-verify.log"
+      pgdata="$mountpoint/pgdata"
+      start_postgres
+      verify_recovery "$cycle_dir" "$base_seq"
+      stop_postgres_clean
+      stop_satchel_clean
+      ;;
     gc-kill)
       stop_load
       stop_postgres_clean
@@ -462,6 +540,12 @@ for ((cycle = 1; cycle <= CYCLES; cycle++)); do
     log "running gc"
     satchel_cmd "$SATCHEL_BIN" vol gc "$volume" >>"$run_root/gc.log" 2>&1 || fail "gc failed, see $run_root/gc.log"
   fi
+  if ((cycle % SATCHEL_FAULT_VERIFY_EVERY == 0)); then
+    log "running vol verify"
+    satchel_cmd "$SATCHEL_BIN" vol verify "$volume" >>"$run_root/verify.log" 2>&1 || \
+      fail "metadata verification failed, see $run_root/verify.log"
+  fi
+  cleanup_cycle_state
   log "cycle $cycle ok"
 done
 
