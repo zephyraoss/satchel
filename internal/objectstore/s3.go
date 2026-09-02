@@ -37,10 +37,13 @@ func NewS3(cfg S3Config) *S3 {
 		region = "us-east-1"
 	}
 	client := s3.New(s3.Options{
-		Region:       region,
-		Credentials:  credentials.NewStaticCredentialsProvider(cfg.AccessKeyID, cfg.SecretKey, ""),
-		BaseEndpoint: optionalString(cfg.Endpoint),
-		UsePathStyle: cfg.ForcePathStyle,
+		Region:                       region,
+		Credentials:                  credentials.NewStaticCredentialsProvider(cfg.AccessKeyID, cfg.SecretKey, ""),
+		BaseEndpoint:                 optionalString(cfg.Endpoint),
+		UsePathStyle:                 cfg.ForcePathStyle,
+		ContinueHeaderThresholdBytes: -1,
+		RequestChecksumCalculation:   aws.RequestChecksumCalculationWhenRequired,
+		ResponseChecksumValidation:   aws.ResponseChecksumValidationWhenRequired,
 	})
 	return &S3{client: client, bucket: cfg.Bucket}
 }
@@ -70,19 +73,21 @@ func (s *S3) Get(ctx context.Context, key string) (Object, error) {
 
 func (s *S3) PutIfAbsent(ctx context.Context, key string, data []byte) (string, error) {
 	return s.put(ctx, &s3.PutObjectInput{
-		Bucket:      &s.bucket,
-		Key:         &key,
-		Body:        bytes.NewReader(data),
-		IfNoneMatch: aws.String("*"),
+		Bucket:        &s.bucket,
+		Key:           &key,
+		Body:          bytes.NewReader(data),
+		ContentLength: aws.Int64(int64(len(data))),
+		IfNoneMatch:   aws.String("*"),
 	})
 }
 
 func (s *S3) PutIfMatch(ctx context.Context, key string, data []byte, etag string) (string, error) {
 	newETag, err := s.put(ctx, &s3.PutObjectInput{
-		Bucket:  &s.bucket,
-		Key:     &key,
-		Body:    bytes.NewReader(data),
-		IfMatch: aws.String(etag),
+		Bucket:        &s.bucket,
+		Key:           &key,
+		Body:          bytes.NewReader(data),
+		ContentLength: aws.Int64(int64(len(data))),
+		IfMatch:       aws.String(etag),
 	})
 	if isMissingKey(err) {
 		return "", ErrPreconditionFailed

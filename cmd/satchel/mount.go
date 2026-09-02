@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/docker/go-plugins-helpers/volume"
 	"github.com/spf13/cobra"
@@ -50,6 +51,7 @@ func runMount(ctx context.Context, opts pluginOptions, name string, volumeOpts m
 	if err != nil {
 		return err
 	}
+	startMetricsServer(opts.metricsAddr, logger)
 	if len(volumeOpts) == 0 {
 		if resp, err := driver.Mount(&volume.MountRequest{Name: name, ID: "satchel-mount"}); err == nil {
 			return waitForUnmount(ctx, driver, logger, name, resp.Mountpoint)
@@ -70,8 +72,28 @@ func runMount(ctx context.Context, opts pluginOptions, name string, volumeOpts m
 func waitForUnmount(ctx context.Context, driver *plugin.Driver, logger *slog.Logger, name, mountpoint string) error {
 	fmt.Println(mountpoint)
 	sigCtx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 	<-sigCtx.Done()
+	stop()
 	logger.Info("unmounting")
-	return driver.Unmount(&volume.UnmountRequest{Name: name, ID: "satchel-mount"})
+	request := &volume.UnmountRequest{Name: name, ID: "satchel-mount"}
+	return retryBusyUnmount(ctx, logger, time.Second, func() error {
+		return driver.Unmount(request)
+	})
+}
+
+func retryBusyUnmount(ctx context.Context, logger *slog.Logger, interval time.Duration, unmount func() error) error {
+	for {
+		err := unmount()
+		if err == nil || !errors.Is(err, syscall.EBUSY) {
+			return err
+		}
+		logger.Warn("filesystem is still busy; clean unmount will retry", "retry_in", interval)
+		timer := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return errors.Join(err, ctx.Err())
+		case <-timer.C:
+		}
+	}
 }

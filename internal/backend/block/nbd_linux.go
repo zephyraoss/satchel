@@ -74,7 +74,7 @@ func Attach(ctx context.Context, device *replica.Device, readOnly bool) (*Attach
 			continue
 		}
 		attachment, err := attachAt(ctx, path, device, readOnly)
-		if errors.Is(err, unix.EBUSY) {
+		if errors.Is(err, unix.EBUSY) || errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
 			continue
 		}
 		if err != nil {
@@ -238,56 +238,127 @@ func (a *Attachment) Close() error {
 	return a.closeErr
 }
 
-func serveNBD(conn io.ReadWriter, device *replica.Device, readOnly bool) error {
+func serveNBD(conn net.Conn, device *replica.Device, readOnly bool) error {
+	var replies sync.Mutex
+	var pending sync.WaitGroup
+	workerErrors := make(chan error, 1)
+	var closeOnce sync.Once
+	recordWorkerError := func(err error) {
+		if err == nil {
+			return
+		}
+		select {
+		case workerErrors <- err:
+		default:
+		}
+		closeOnce.Do(func() { _ = conn.Close() })
+	}
+	sendReply := func(handle [8]byte, requestErr error, data []byte) error {
+		replies.Lock()
+		err := writeReply(conn, handle[:], errno(requestErr), data)
+		replies.Unlock()
+		if err != nil {
+			recordWorkerError(err)
+		}
+		return err
+	}
+	waitForWorkers := func(readErr error) error {
+		pending.Wait()
+		select {
+		case err := <-workerErrors:
+			return err
+		default:
+			return readErr
+		}
+	}
+
+	closedBarrier := make(chan struct{})
+	close(closedBarrier)
+	previousBarrier := (<-chan struct{})(closedBarrier)
+	dispatchBarrier := func(handle [8]byte, requestErr error) {
+		var remoteResult <-chan error
+		if requestErr == nil {
+			remoteResult, requestErr = device.BeginRemoteFlush()
+		}
+		prior := previousBarrier
+		done := make(chan struct{})
+		previousBarrier = done
+		pending.Add(1)
+		go func() {
+			defer pending.Done()
+			<-prior
+			if requestErr == nil {
+				requestErr = <-remoteResult
+			}
+			close(done)
+			_ = sendReply(handle, requestErr, nil)
+		}()
+	}
+
 	header := make([]byte, 28)
 	for {
 		if _, err := io.ReadFull(conn, header); err != nil {
-			return err
+			_ = conn.Close()
+			return waitForWorkers(err)
 		}
 		if binary.BigEndian.Uint32(header[0:4]) != nbdRequestMagic {
-			return errors.New("invalid NBD request magic")
+			_ = conn.Close()
+			return waitForWorkers(errors.New("invalid NBD request magic"))
 		}
 		typeAndFlags := binary.BigEndian.Uint32(header[4:8])
 		command := typeAndFlags & nbdCmdMask
-		handle := append([]byte(nil), header[8:16]...)
+		var handle [8]byte
+		copy(handle[:], header[8:16])
 		offset := binary.BigEndian.Uint64(header[16:24])
 		length := binary.BigEndian.Uint32(header[24:28])
 		if command == nbdCmdDisconnect {
-			return nil
+			_ = conn.Close()
+			return waitForWorkers(nil)
 		}
-		if length > maxNBDRequest || offset > uint64(device.Size()) || uint64(length) > uint64(device.Size())-offset {
+		payloadTooLarge := (command == nbdCmdRead || command == nbdCmdWrite) && length > maxNBDRequest
+		if payloadTooLarge || offset > uint64(device.Size()) || uint64(length) > uint64(device.Size())-offset {
 			if command == nbdCmdWrite {
 				if _, err := io.CopyN(io.Discard, conn, int64(length)); err != nil {
-					return err
+					return waitForWorkers(err)
 				}
 			}
-			if err := writeReply(conn, handle, unix.EINVAL, nil); err != nil {
-				return err
+			if err := sendReply(handle, unix.EINVAL, nil); err != nil {
+				return waitForWorkers(err)
 			}
 			continue
 		}
 
 		var data []byte
+		if command == nbdCmdRead || command == nbdCmdWrite {
+			data = make([]byte, int(length))
+		}
+		if command == nbdCmdWrite {
+			if _, err := io.ReadFull(conn, data); err != nil {
+				_ = conn.Close()
+				return waitForWorkers(err)
+			}
+		}
+		if command == nbdCmdFlush {
+			if device.RemoteFlushEnabled() {
+				dispatchBarrier(handle, nil)
+			} else if err := sendReply(handle, device.Flush(), nil); err != nil {
+				return waitForWorkers(err)
+			}
+			continue
+		}
+
+		var response []byte
 		var requestErr error
 		switch command {
 		case nbdCmdRead:
-			data = make([]byte, length)
-			_, requestErr = device.ReadAt(data, int64(offset))
+			response = data
+			_, requestErr = device.ReadAt(response, int64(offset))
 		case nbdCmdWrite:
-			data = make([]byte, length)
-			if _, requestErr = io.ReadFull(conn, data); requestErr == nil {
-				if readOnly {
-					requestErr = unix.EROFS
-				} else {
-					_, requestErr = device.WriteAt(data, int64(offset))
-				}
+			if readOnly {
+				requestErr = unix.EROFS
+			} else {
+				_, requestErr = device.WriteAt(data, int64(offset))
 			}
-			data = nil
-			if requestErr == nil && typeAndFlags&nbdCmdFlagFUA != 0 {
-				requestErr = device.Flush()
-			}
-		case nbdCmdFlush:
-			requestErr = device.Flush()
 		case nbdCmdTrim, nbdCmdWriteZeroes:
 			if readOnly {
 				requestErr = unix.EROFS
@@ -297,8 +368,21 @@ func serveNBD(conn io.ReadWriter, device *replica.Device, readOnly bool) error {
 		default:
 			requestErr = unix.EINVAL
 		}
-		if err := writeReply(conn, handle, errno(requestErr), data); err != nil {
-			return err
+		if command == nbdCmdWrite && typeAndFlags&nbdCmdFlagFUA != 0 {
+			if device.RemoteFlushEnabled() {
+				dispatchBarrier(handle, requestErr)
+			} else {
+				if requestErr == nil {
+					requestErr = device.Flush()
+				}
+				if err := sendReply(handle, requestErr, nil); err != nil {
+					return waitForWorkers(err)
+				}
+			}
+			continue
+		}
+		if err := sendReply(handle, requestErr, response); err != nil {
+			return waitForWorkers(err)
 		}
 	}
 }
@@ -315,11 +399,11 @@ func errno(err error) syscall.Errno {
 }
 
 func writeReply(w io.Writer, handle []byte, errno syscall.Errno, data []byte) error {
-	reply := make([]byte, 16)
+	var reply [16]byte
 	binary.BigEndian.PutUint32(reply[0:4], nbdReplyMagic)
 	binary.BigEndian.PutUint32(reply[4:8], uint32(errno))
 	copy(reply[8:16], handle)
-	if err := writeFull(w, reply); err != nil {
+	if err := writeFull(w, reply[:]); err != nil {
 		return err
 	}
 	if errno == 0 && len(data) > 0 {

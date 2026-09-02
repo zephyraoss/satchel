@@ -141,7 +141,18 @@ func buildDriver(ctx context.Context, opts pluginOptions) (*plugin.Driver, *slog
 			HistoryRetention: opts.historyRetention, GCGrace: opts.gcGrace,
 			Logger: logger, Seeder: &seed.Seeder{Fetch: store.Fetch},
 		},
-		&replica.Remote{Store: store, TTL: opts.leaseTTL},
+		&replica.Remote{
+			Store: store, TTL: opts.leaseTTL,
+			Observe: func(stage string, duration time.Duration) {
+				metrics.ReplicationStageDuration.WithLabelValues(stage).Observe(duration.Seconds())
+			},
+			ObserveGeneration: func(inputBytes, storedBytes int64, segments int) {
+				metrics.ReplicationGenerations.Inc()
+				metrics.ReplicationInputBytes.Add(float64(inputBytes))
+				metrics.ReplicationStoredBytes.Add(float64(storedBytes))
+				metrics.ReplicationSegments.Add(float64(segments))
+			},
+		},
 		block.New(block.Options{Logger: logger}),
 	)
 	if err != nil {
@@ -156,16 +167,7 @@ func runPlugin(ctx context.Context, opts pluginOptions) error {
 		return err
 	}
 
-	if opts.metricsAddr != "" {
-		go func() {
-			mux := http.NewServeMux()
-			mux.Handle("/metrics", metrics.Handler())
-			logger.Info("metrics listening", "addr", opts.metricsAddr)
-			if err := http.ListenAndServe(opts.metricsAddr, mux); err != nil {
-				logger.Error("metrics server stopped", "err", err)
-			}
-		}()
-	}
+	startMetricsServer(opts.metricsAddr, logger)
 
 	handler := volume.NewHandler(driver)
 	errCh := make(chan error, 1)
@@ -189,6 +191,20 @@ func runPlugin(ctx context.Context, opts pluginOptions) error {
 		return err
 	}
 	return nil
+}
+
+func startMetricsServer(addr string, logger *slog.Logger) {
+	if addr == "" {
+		return
+	}
+	go func() {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", metrics.Handler())
+		logger.Info("metrics listening", "addr", addr)
+		if err := http.ListenAndServe(addr, mux); err != nil {
+			logger.Error("metrics server stopped", "err", err)
+		}
+	}()
 }
 
 func parseBytes(s string) (int64, error) {

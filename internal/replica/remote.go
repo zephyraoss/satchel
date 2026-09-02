@@ -33,18 +33,20 @@ type LeaseRecord struct {
 }
 
 type State struct {
-	Format     string       `json:"format"`
-	ID         string       `json:"id"`
-	Name       string       `json:"name"`
-	Size       int64        `json:"size"`
-	BlockSize  int64        `json:"block_size"`
-	Filesystem string       `json:"filesystem"`
-	Generation uint64       `json:"generation"`
-	Manifest   string       `json:"manifest,omitempty"`
-	Checkpoint uint64       `json:"checkpoint_generation,omitempty"`
-	Epoch      uint64       `json:"epoch"`
-	Deleting   bool         `json:"deleting,omitempty"`
-	Lease      *LeaseRecord `json:"lease,omitempty"`
+	Format          string                     `json:"format"`
+	ID              string                     `json:"id"`
+	Name            string                     `json:"name"`
+	Size            int64                      `json:"size"`
+	BlockSize       int64                      `json:"block_size"`
+	Filesystem      string                     `json:"filesystem"`
+	Generation      uint64                     `json:"generation"`
+	Manifest        string                     `json:"manifest,omitempty"`
+	InlineManifests map[string]json.RawMessage `json:"inline_manifests,omitempty"`
+	ManifestBundle  *ManifestBundleRef         `json:"manifest_bundle,omitempty"`
+	Checkpoint      uint64                     `json:"checkpoint_generation,omitempty"`
+	Epoch           uint64                     `json:"epoch"`
+	Deleting        bool                       `json:"deleting,omitempty"`
+	Lease           *LeaseRecord               `json:"lease,omitempty"`
 }
 
 type Manifest struct {
@@ -59,10 +61,43 @@ type Manifest struct {
 }
 
 type ObjectRef struct {
-	Key    string `json:"key"`
-	SHA256 string `json:"sha256"`
-	Bytes  int64  `json:"bytes"`
-	Blocks int64  `json:"blocks"`
+	Key            string   `json:"key,omitempty"`
+	SourceManifest string   `json:"source_manifest,omitempty"`
+	SourceBundle   string   `json:"source_bundle,omitempty"`
+	SourceIndex    uint32   `json:"source_index,omitempty"`
+	InlineData     []byte   `json:"inline_data,omitempty"`
+	SHA256         string   `json:"sha256"`
+	Bytes          int64    `json:"bytes"`
+	Blocks         int64    `json:"blocks"`
+	Extents        []Extent `json:"extents"`
+	ZeroExtents    []Extent `json:"zero_extents,omitempty"`
+}
+
+const (
+	inlineSegmentLimit       = 64 << 10
+	inlineManifestLimit      = 64 << 10
+	inlineManifestStateLimit = 64 << 10
+	manifestBundleTarget     = 16 << 10
+)
+
+type ManifestBundleRef struct {
+	Key             string `json:"key"`
+	FirstGeneration uint64 `json:"first_generation"`
+	LastGeneration  uint64 `json:"last_generation"`
+}
+
+type manifestBundle struct {
+	Format          string             `json:"format"`
+	VolumeID        string             `json:"volume_id"`
+	FirstGeneration uint64             `json:"first_generation"`
+	LastGeneration  uint64             `json:"last_generation"`
+	Parent          *ManifestBundleRef `json:"parent,omitempty"`
+	Manifests       []bundledManifest  `json:"manifests"`
+}
+
+type bundledManifest struct {
+	Key  string          `json:"key"`
+	Body json.RawMessage `json:"body"`
 }
 
 type RestoreOptions struct {
@@ -93,9 +128,28 @@ type CreateOptions struct {
 }
 
 type Remote struct {
-	Store objectstore.Store
-	TTL   time.Duration
-	Now   func() time.Time
+	Store             objectstore.Store
+	TTL               time.Duration
+	Now               func() time.Time
+	Observe           func(stage string, duration time.Duration)
+	ObserveGeneration func(inputBytes, storedBytes int64, segments int)
+}
+
+func (r *Remote) observeGeneration(generation *Generation, segments []Segment) {
+	if r.ObserveGeneration == nil {
+		return
+	}
+	var stored int64
+	for _, segment := range segments {
+		stored += segment.Bytes
+	}
+	r.ObserveGeneration(generation.Bytes(), stored, len(segments))
+}
+
+func (r *Remote) observe(stage string, started time.Time) {
+	if r.Observe != nil {
+		r.Observe(stage, time.Since(started))
+	}
 }
 
 func StateKey(name string) string     { return "volumes/" + name + "/state.json" }
@@ -146,7 +200,28 @@ func validateState(name string, state State) error {
 	if (state.Generation == 0) != (state.Manifest == "") {
 		return fmt.Errorf("volume %s has inconsistent generation metadata", name)
 	}
+	inlineBytes := 0
+	for key, body := range state.InlineManifests {
+		inlineBytes += len(body)
+		if inlineBytes > inlineManifestStateLimit {
+			return fmt.Errorf("volume %s has too much inline manifest data", name)
+		}
+		if _, err := decodeManifest(state, key, body, 0); err != nil {
+			return err
+		}
+	}
+	if bundle := state.ManifestBundle; bundle != nil {
+		if !validManifestBundleRef(state.Name, *bundle) {
+			return fmt.Errorf("volume %s has an invalid manifest bundle", name)
+		}
+	}
 	return nil
+}
+
+func validManifestBundleRef(name string, ref ManifestBundleRef) bool {
+	prefix := VolumePrefix(name) + "manifest-bundles/"
+	return strings.HasPrefix(ref.Key, prefix) && strings.HasSuffix(ref.Key, ".json") &&
+		ref.FirstGeneration > 0 && ref.LastGeneration >= ref.FirstGeneration
 }
 
 type HeldError struct {
@@ -222,15 +297,26 @@ func (r *Remote) Acquire(ctx context.Context, name, holder string, opts CreateOp
 	if err != nil {
 		return nil, false, err
 	}
-	return &Lease{remote: r, state: state, etag: etag}, created, nil
+	lease := &Lease{
+		remote: r, state: state, etag: etag,
+		planKnown: state.Generation == 0,
+	}
+	lease.startManifestBundleArchive()
+	return lease, created, nil
 }
 
 type Lease struct {
-	mu     sync.Mutex
-	remote *Remote
-	state  State
-	etag   string
-	lost   bool
+	mu        sync.Mutex
+	remote    *Remote
+	state     State
+	etag      string
+	lost      bool
+	plan      []ObjectRef
+	planKnown bool
+
+	bundleInFlight string
+	bundleDone     chan struct{}
+	readyBundle    *preparedManifestBundle
 }
 
 func (l *Lease) Heartbeat(ctx context.Context, onLost func(error)) {
@@ -245,6 +331,10 @@ func (l *Lease) Heartbeat(ctx context.Context, onLost func(error)) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+		}
+		state := l.State()
+		if state.Lease != nil && state.Lease.ExpiresAt.After(l.remote.now().Add(2*interval)) {
+			continue
 		}
 		renewCtx, cancel := context.WithTimeout(ctx, interval)
 		err := l.Renew(renewCtx)
@@ -267,7 +357,7 @@ func (l *Lease) Heartbeat(ctx context.Context, onLost func(error)) {
 func (l *Lease) State() State {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.state
+	return cloneState(l.state)
 }
 
 func (l *Lease) update(ctx context.Context, mutate func(*State) error) error {
@@ -276,10 +366,10 @@ func (l *Lease) update(ctx context.Context, mutate func(*State) error) error {
 	if l.lost || l.state.Lease == nil {
 		return ErrLeaseLost
 	}
-	candidate := l.state
-	if l.state.Lease != nil {
-		lease := *l.state.Lease
-		candidate.Lease = &lease
+	candidate := cloneState(l.state)
+	bundle := l.readyManifestBundleLocked()
+	if bundle != nil {
+		applyManifestBundle(&candidate, bundle)
 	}
 	if err := mutate(&candidate); err != nil {
 		return err
@@ -298,6 +388,10 @@ func (l *Lease) update(ctx context.Context, mutate func(*State) error) error {
 	}
 	l.state = candidate
 	l.etag = etag
+	if bundle != nil {
+		l.plan = attachBundleToRefs(l.plan, bundle)
+		l.readyBundle = nil
+	}
 	return nil
 }
 
@@ -320,29 +414,106 @@ func (l *Lease) Renew(ctx context.Context) error {
 	})
 }
 
-func (l *Lease) Publish(ctx context.Context, segment Segment) error {
-	if segment.SHA256 == "" || len(segment.Data) == 0 {
-		return errors.New("invalid segment")
+func (l *Lease) Publish(ctx context.Context, segments ...Segment) error {
+	if len(segments) == 0 {
+		return errors.New("cannot publish an empty generation")
+	}
+	for _, segment := range segments {
+		if segment.SHA256 == "" || len(segment.Data) == 0 || len(segment.Extents) == 0 {
+			return errors.New("invalid segment")
+		}
 	}
 	l.mu.Lock()
 	if l.lost || l.state.Lease == nil {
 		l.mu.Unlock()
 		return ErrLeaseLost
 	}
-	snapshot := l.state
+	snapshot := cloneState(l.state)
 	l.mu.Unlock()
+	maxBlocks := uint64(snapshot.Size / snapshot.BlockSize)
+	var generationExtents []Extent
+	var generationBlocks uint64
+	for index, segment := range segments {
+		blocks, err := validateExtents(segment.Extents, maxBlocks)
+		if err != nil || blocks != uint64(segment.Blocks) {
+			return fmt.Errorf("segment %d has invalid extents", index)
+		}
+		if _, err := validateExtents(segment.ZeroExtents, maxBlocks); err != nil || !extentsContain(segment.Extents, segment.ZeroExtents) {
+			return fmt.Errorf("segment %d has invalid zero extents", index)
+		}
+		if generationBlocks > ^uint64(0)-blocks {
+			return errors.New("segment block count overflows")
+		}
+		generationBlocks += blocks
+		generationExtents = append(generationExtents, segment.Extents...)
+	}
+	coveredBlocks, err := validateExtents(unionExtents(nil, generationExtents), maxBlocks)
+	if err != nil || coveredBlocks != generationBlocks {
+		return errors.New("segments overlap within generation")
+	}
 
-	ref, err := l.uploadSegment(ctx, snapshot, segment)
-	if err != nil {
-		return err
+	refs := make([]ObjectRef, len(segments))
+	for index, segment := range segments {
+		refs[index] = segmentReference(snapshot, segment)
 	}
 	manifest := Manifest{
 		Format: Format, VolumeID: snapshot.ID, Generation: snapshot.Generation + 1,
 		Epoch: snapshot.Epoch, Kind: "delta", Parent: snapshot.Manifest,
-		Segments:  []ObjectRef{ref},
-		CreatedAt: l.remote.now(),
+		Segments: refs, CreatedAt: l.remote.now(),
 	}
-	return l.publishManifest(ctx, snapshot, manifest)
+	prepared, err := prepareManifest(snapshot, manifest)
+	if err != nil {
+		return err
+	}
+	return l.publishPrepared(ctx, snapshot, prepared, segments, nil, false)
+}
+
+func (l *Lease) uploadSegments(ctx context.Context, snapshot State, segments []Segment) ([]ObjectRef, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	refs := make([]ObjectRef, len(segments))
+	jobs := make(chan int)
+	var firstErr error
+	var errOnce sync.Once
+	worker := func() {
+		for index := range jobs {
+			ref, err := l.uploadSegment(ctx, snapshot, segments[index])
+			if err != nil {
+				errOnce.Do(func() {
+					firstErr = err
+					cancel()
+				})
+				continue
+			}
+			refs[index] = ref
+		}
+	}
+	workers := min(4, len(segments))
+	var group sync.WaitGroup
+	group.Add(workers)
+	for range workers {
+		go func() {
+			defer group.Done()
+			worker()
+		}()
+	}
+sendLoop:
+	for index := range segments {
+		select {
+		case jobs <- index:
+		case <-ctx.Done():
+			break sendLoop
+		}
+	}
+	close(jobs)
+	group.Wait()
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return refs, nil
 }
 
 func segmentKey(name string, epoch, generation uint64, digest string) string {
@@ -350,69 +521,387 @@ func segmentKey(name string, epoch, generation uint64, digest string) string {
 }
 
 func (l *Lease) uploadSegment(ctx context.Context, snapshot State, segment Segment) (ObjectRef, error) {
-	segmentKey := segmentKey(snapshot.Name, snapshot.Epoch, snapshot.Generation+1, segment.SHA256)
-	if _, err := l.remote.Store.PutIfAbsent(ctx, segmentKey, segment.Data); err != nil {
+	ref := segmentReference(snapshot, segment)
+	if len(ref.InlineData) != 0 {
+		return ref, nil
+	}
+	if _, err := l.remote.Store.PutIfAbsent(ctx, ref.Key, segment.Data); err != nil {
 		if !errors.Is(err, objectstore.ErrPreconditionFailed) {
 			return ObjectRef{}, fmt.Errorf("upload segment: %w", err)
 		}
-		existing, getErr := l.remote.Store.Get(ctx, segmentKey)
+		existing, getErr := l.remote.Store.Get(ctx, ref.Key)
 		if getErr != nil || !bytes.Equal(existing.Data, segment.Data) {
-			return ObjectRef{}, fmt.Errorf("segment object %s exists with different content", segmentKey)
+			return ObjectRef{}, fmt.Errorf("segment object %s exists with different content", ref.Key)
 		}
 	}
-	return ObjectRef{Key: segmentKey, SHA256: segment.SHA256, Bytes: segment.Bytes, Blocks: segment.Blocks}, nil
+	return ref, nil
 }
 
-type Checkpoint struct {
-	lease    *Lease
-	snapshot State
-	refs     []ObjectRef
-}
-
-func (l *Lease) BeginCheckpoint() (*Checkpoint, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.lost || l.state.Lease == nil {
-		return nil, ErrLeaseLost
+func segmentReference(snapshot State, segment Segment) ObjectRef {
+	ref := ObjectRef{
+		Key:    segmentKey(snapshot.Name, snapshot.Epoch, snapshot.Generation+1, segment.SHA256),
+		SHA256: segment.SHA256, Bytes: segment.Bytes, Blocks: segment.Blocks,
+		Extents: append([]Extent(nil), segment.Extents...), ZeroExtents: append([]Extent(nil), segment.ZeroExtents...),
 	}
-	return &Checkpoint{lease: l, snapshot: l.state}, nil
-
+	if len(segment.Data) <= inlineSegmentLimit {
+		ref.Key = ""
+		ref.InlineData = segment.Data
+	}
+	return ref
 }
 
-func (c *Checkpoint) Add(ctx context.Context, segment Segment) error {
-	ref, err := c.lease.uploadSegment(ctx, c.snapshot, segment)
+func (l *Lease) PublishCheckpoint(ctx context.Context) error {
+	l.mu.Lock()
+	if l.lost || l.state.Lease == nil {
+		l.mu.Unlock()
+		return ErrLeaseLost
+	}
+	snapshot := cloneState(l.state)
+	refs := cloneObjectRefs(l.plan)
+	planKnown := l.planKnown
+	l.mu.Unlock()
+
+	if !planKnown {
+		var err error
+		refs, err = l.remote.restorePlan(ctx, snapshot)
+		if err != nil {
+			return err
+		}
+	}
+	bundle, err := prepareManifestBundle(snapshot)
 	if err != nil {
 		return err
 	}
-	c.refs = append(c.refs, ref)
+	if bundle != nil {
+		refs = attachBundleToRefs(refs, bundle)
+	}
+	refs = checkpointReadyRefs(refs)
+	manifest := Manifest{
+		Format: Format, VolumeID: snapshot.ID, Generation: snapshot.Generation + 1,
+		Epoch: snapshot.Epoch, Kind: "checkpoint", Parent: snapshot.Manifest,
+		Segments: refs, CreatedAt: l.remote.now(),
+	}
+	prepared, err := prepareManifest(snapshot, manifest)
+	if err != nil {
+		return err
+	}
+	return l.publishPrepared(ctx, snapshot, prepared, nil, bundle, true)
+}
+
+type preparedManifestBundle struct {
+	ref      ManifestBundleRef
+	body     []byte
+	keys     map[string]struct{}
+	uploaded bool
+}
+
+func (l *Lease) publishPrepared(
+	ctx context.Context,
+	snapshot State,
+	prepared preparedManifest,
+	segments []Segment,
+	bundle *preparedManifestBundle,
+	archiveCurrent bool,
+) error {
+	if bundle == nil && !archiveCurrent {
+		bundle = l.readyManifestBundle(snapshot)
+	}
+	if len(prepared.body) > inlineManifestLimit {
+		archiveCurrent = true
+	}
+	embed := !archiveCurrent && len(prepared.body) <= inlineManifestLimit &&
+		inlineManifestBytesAfterBundle(snapshot.InlineManifests, bundle)+len(prepared.body) <= inlineManifestStateLimit
+	if !embed && bundle == nil && !archiveCurrent {
+		var err error
+		bundle, err = prepareManifestBundle(snapshot)
+		if err != nil {
+			return err
+		}
+		if len(prepared.body) <= inlineManifestLimit {
+			embed = true
+		} else {
+			archiveCurrent = true
+		}
+	}
+
+	uploadCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var firstErr error
+	var errOnce sync.Once
+	recordError := func(err error) {
+		if err == nil {
+			return
+		}
+		errOnce.Do(func() {
+			firstErr = err
+			cancel()
+		})
+	}
+	var uploads sync.WaitGroup
+	if len(segments) != 0 {
+		uploads.Add(1)
+		go func() {
+			defer uploads.Done()
+			started := time.Now()
+			_, err := l.uploadSegments(uploadCtx, snapshot, segments)
+			l.remote.observe("segments", started)
+			recordError(err)
+		}()
+	}
+	if bundle != nil && !bundle.uploaded {
+		uploads.Add(1)
+		go func() {
+			defer uploads.Done()
+			started := time.Now()
+			err := l.uploadManifestBundle(uploadCtx, *bundle)
+			l.remote.observe("manifest_bundle", started)
+			recordError(err)
+		}()
+	}
+	if archiveCurrent {
+		uploads.Add(1)
+		go func() {
+			defer uploads.Done()
+			started := time.Now()
+			err := l.uploadManifest(uploadCtx, prepared)
+			l.remote.observe("manifest", started)
+			recordError(err)
+		}()
+	}
+	uploads.Wait()
+	if firstErr != nil {
+		return firstErr
+	}
+
+	started := time.Now()
+	err := l.commitManifest(ctx, snapshot, prepared, embed, bundle)
+	l.remote.observe("head", started)
+	if err == nil {
+		l.startManifestBundleArchive()
+	}
+	return err
+}
+
+func inlineManifestBytes(manifests map[string]json.RawMessage) int {
+	var total int
+	for _, body := range manifests {
+		total += len(body)
+	}
+	return total
+}
+
+func inlineManifestBytesAfterBundle(manifests map[string]json.RawMessage, bundle *preparedManifestBundle) int {
+	var total int
+	for key, body := range manifests {
+		if bundle != nil {
+			if _, ok := bundle.keys[key]; ok {
+				continue
+			}
+		}
+		total += len(body)
+	}
+	return total
+}
+
+func prepareManifestBundle(snapshot State) (*preparedManifestBundle, error) {
+	if len(snapshot.InlineManifests) == 0 {
+		return nil, nil
+	}
+	type entryWithGeneration struct {
+		entry      bundledManifest
+		generation uint64
+	}
+	entries := make([]entryWithGeneration, 0, len(snapshot.InlineManifests))
+	for key, body := range snapshot.InlineManifests {
+		manifest, err := decodeManifest(snapshot, key, body, 0)
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, entryWithGeneration{
+			entry: bundledManifest{Key: key, Body: append(json.RawMessage(nil), body...)}, generation: manifest.Generation,
+		})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].generation < entries[j].generation })
+	bundle := manifestBundle{
+		Format: Format, VolumeID: snapshot.ID,
+		FirstGeneration: entries[0].generation, LastGeneration: entries[len(entries)-1].generation,
+		Manifests: make([]bundledManifest, len(entries)),
+	}
+	if snapshot.ManifestBundle != nil {
+		parent := *snapshot.ManifestBundle
+		bundle.Parent = &parent
+	}
+	keys := make(map[string]struct{}, len(entries))
+	for index, entry := range entries {
+		bundle.Manifests[index] = entry.entry
+		keys[entry.entry.Key] = struct{}{}
+	}
+	body, err := json.Marshal(bundle)
+	if err != nil {
+		return nil, err
+	}
+	hash := sha256.Sum256(body)
+	key := VolumePrefix(snapshot.Name) + "manifest-bundles/" + hex.EncodeToString(hash[:]) + ".json"
+	return &preparedManifestBundle{
+		ref:  ManifestBundleRef{Key: key, FirstGeneration: bundle.FirstGeneration, LastGeneration: bundle.LastGeneration},
+		body: body, keys: keys,
+	}, nil
+}
+
+func attachBundleToRefs(refs []ObjectRef, bundle *preparedManifestBundle) []ObjectRef {
+	result := cloneObjectRefs(refs)
+	for index := range result {
+		if _, ok := bundle.keys[result[index].SourceManifest]; ok {
+			result[index].SourceBundle = bundle.ref.Key
+		}
+	}
+	return result
+}
+
+func (l *Lease) uploadManifestBundle(ctx context.Context, bundle preparedManifestBundle) error {
+	if _, err := l.remote.Store.PutIfAbsent(ctx, bundle.ref.Key, bundle.body); err != nil {
+		if !errors.Is(err, objectstore.ErrPreconditionFailed) {
+			return fmt.Errorf("upload manifest bundle: %w", err)
+		}
+		existing, getErr := l.remote.Store.Get(ctx, bundle.ref.Key)
+		if getErr != nil || !bytes.Equal(existing.Data, bundle.body) {
+			return fmt.Errorf("manifest bundle %s exists with different content", bundle.ref.Key)
+		}
+	}
 	return nil
 }
 
-func (c *Checkpoint) Commit(ctx context.Context) error {
-	manifest := Manifest{
-		Format: Format, VolumeID: c.snapshot.ID, Generation: c.snapshot.Generation + 1,
-		Epoch: c.snapshot.Epoch, Kind: "checkpoint", Parent: c.snapshot.Manifest, Segments: c.refs, CreatedAt: c.lease.remote.now(),
+func (l *Lease) readyManifestBundle(snapshot State) *preparedManifestBundle {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	bundle := l.readyManifestBundleLocked()
+	if bundle == nil || !manifestBundleApplies(snapshot, bundle) {
+		return nil
 	}
-	return c.lease.publishManifest(ctx, c.snapshot, manifest)
+	return bundle
 }
 
-func (l *Lease) publishManifest(ctx context.Context, snapshot State, manifest Manifest) error {
+func (l *Lease) readyManifestBundleLocked() *preparedManifestBundle {
+	if l.readyBundle == nil || !manifestBundleApplies(l.state, l.readyBundle) {
+		l.readyBundle = nil
+		return nil
+	}
+	return l.readyBundle
+}
+
+func manifestBundleApplies(state State, bundle *preparedManifestBundle) bool {
+	if bundle == nil {
+		return false
+	}
+	currentParent := ""
+	if state.ManifestBundle != nil {
+		currentParent = state.ManifestBundle.Key
+	}
+	bundleParent := ""
+	var decoded manifestBundle
+	if err := json.Unmarshal(bundle.body, &decoded); err != nil {
+		return false
+	}
+	if decoded.Parent != nil {
+		bundleParent = decoded.Parent.Key
+	}
+	if currentParent != bundleParent {
+		return false
+	}
+	for key := range bundle.keys {
+		if _, ok := state.InlineManifests[key]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func applyManifestBundle(state *State, bundle *preparedManifestBundle) {
+	for key := range bundle.keys {
+		delete(state.InlineManifests, key)
+	}
+	if len(state.InlineManifests) == 0 {
+		state.InlineManifests = nil
+	}
+	bundleRef := bundle.ref
+	state.ManifestBundle = &bundleRef
+}
+
+func (l *Lease) startManifestBundleArchive() {
+	l.mu.Lock()
+	if l.lost || l.state.Lease == nil || l.bundleInFlight != "" || l.readyBundle != nil ||
+		inlineManifestBytes(l.state.InlineManifests) < manifestBundleTarget {
+		l.mu.Unlock()
+		return
+	}
+	snapshot := cloneState(l.state)
+	bundle, err := prepareManifestBundle(snapshot)
+	if err != nil || bundle == nil {
+		l.mu.Unlock()
+		return
+	}
+	l.bundleInFlight = bundle.ref.Key
+	done := make(chan struct{})
+	l.bundleDone = done
+	l.mu.Unlock()
+
+	go func() {
+		defer close(done)
+		ctx, cancel := context.WithTimeout(context.Background(), l.remote.ttl())
+		started := time.Now()
+		err := l.uploadManifestBundle(ctx, *bundle)
+		l.remote.observe("manifest_bundle_background", started)
+		cancel()
+
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		if l.bundleInFlight == bundle.ref.Key {
+			l.bundleInFlight = ""
+			l.bundleDone = nil
+		}
+		if err == nil && manifestBundleApplies(l.state, bundle) {
+			bundle.uploaded = true
+			l.readyBundle = bundle
+		}
+	}()
+}
+
+type preparedManifest struct {
+	manifest Manifest
+	body     []byte
+	key      string
+}
+
+func prepareManifest(snapshot State, manifest Manifest) (preparedManifest, error) {
 	manifestBody, err := json.Marshal(manifest)
 	if err != nil {
-		return err
+		return preparedManifest{}, err
 	}
 	hash := sha256.Sum256(manifestBody)
 	manifestKey := VolumePrefix(snapshot.Name) + "manifests/" + hex.EncodeToString(hash[:]) + ".json"
-	if _, err := l.remote.Store.PutIfAbsent(ctx, manifestKey, manifestBody); err != nil {
+	return preparedManifest{manifest: manifest, body: manifestBody, key: manifestKey}, nil
+}
+
+func (l *Lease) uploadManifest(ctx context.Context, prepared preparedManifest) error {
+	if _, err := l.remote.Store.PutIfAbsent(ctx, prepared.key, prepared.body); err != nil {
 		if !errors.Is(err, objectstore.ErrPreconditionFailed) {
 			return fmt.Errorf("upload manifest: %w", err)
 		}
-		existing, getErr := l.remote.Store.Get(ctx, manifestKey)
-		if getErr != nil || !bytes.Equal(existing.Data, manifestBody) {
-			return fmt.Errorf("manifest object %s exists with different content", manifestKey)
+		existing, getErr := l.remote.Store.Get(ctx, prepared.key)
+		if getErr != nil || !bytes.Equal(existing.Data, prepared.body) {
+			return fmt.Errorf("manifest object %s exists with different content", prepared.key)
 		}
 	}
+	return nil
+}
 
+func (l *Lease) commitManifest(
+	ctx context.Context,
+	snapshot State,
+	prepared preparedManifest,
+	embed bool,
+	bundle *preparedManifestBundle,
+) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.lost || l.state.Lease == nil {
@@ -421,11 +910,28 @@ func (l *Lease) publishManifest(ctx context.Context, snapshot State, manifest Ma
 	if l.state.Generation != snapshot.Generation || l.state.Manifest != snapshot.Manifest || l.state.Epoch != snapshot.Epoch {
 		return errors.New("volume head changed during publish")
 	}
-	candidate := l.state
-	candidate.Generation = manifest.Generation
-	candidate.Manifest = manifestKey
-	if manifest.Kind == "checkpoint" {
-		candidate.Checkpoint = manifest.Generation
+	candidate := cloneState(l.state)
+	if bundle != nil {
+		if !manifestBundleApplies(candidate, bundle) {
+			return errors.New("manifest bundle no longer matches volume state")
+		}
+		applyManifestBundle(&candidate, bundle)
+	}
+	if candidate.Lease != nil {
+		lease := *candidate.Lease
+		lease.ExpiresAt = l.remote.now().Add(l.remote.ttl())
+		candidate.Lease = &lease
+	}
+	candidate.Generation = prepared.manifest.Generation
+	candidate.Manifest = prepared.key
+	if embed {
+		if candidate.InlineManifests == nil {
+			candidate.InlineManifests = make(map[string]json.RawMessage)
+		}
+		candidate.InlineManifests[prepared.key] = append(json.RawMessage(nil), prepared.body...)
+	}
+	if prepared.manifest.Kind == "checkpoint" {
+		candidate.Checkpoint = prepared.manifest.Generation
 	}
 	stateBody, err := json.Marshal(candidate)
 	if err != nil {
@@ -441,14 +947,126 @@ func (l *Lease) publishManifest(ctx context.Context, snapshot State, manifest Ma
 	}
 	l.state = candidate
 	l.etag = etag
+	if bundle != nil {
+		l.plan = attachBundleToRefs(l.plan, bundle)
+		if l.readyBundle != nil && l.readyBundle.ref.Key == bundle.ref.Key {
+			l.readyBundle = nil
+		}
+	}
+	switch prepared.manifest.Kind {
+	case "delta":
+		if l.planKnown {
+			l.plan = applyDeltaToPlan(l.plan, checkpointRefs(prepared))
+		}
+	case "checkpoint":
+		l.plan = cloneObjectRefs(prepared.manifest.Segments)
+		l.planKnown = true
+	}
 	return nil
 }
 
+func checkpointRefs(prepared preparedManifest) []ObjectRef {
+	refs := cloneObjectRefs(prepared.manifest.Segments)
+	for index := range refs {
+		if len(refs[index].InlineData) == 0 {
+			continue
+		}
+		refs[index].InlineData = nil
+		refs[index].SourceManifest = prepared.key
+		refs[index].SourceIndex = uint32(index)
+	}
+	return refs
+}
+
+func checkpointReadyRefs(refs []ObjectRef) []ObjectRef {
+	result := cloneObjectRefs(refs)
+	for index := range result {
+		if result[index].SourceManifest != "" {
+			result[index].InlineData = nil
+		}
+	}
+	return result
+}
+
+func applyDeltaToPlan(current, delta []ObjectRef) []ObjectRef {
+	result := make([]ObjectRef, 0, len(delta)+len(current))
+	var covered []Extent
+	for _, original := range delta {
+		visible := subtractExtents(original.Extents, original.ZeroExtents)
+		if len(visible) > 0 {
+			ref := original
+			ref.Extents = visible
+			ref.ZeroExtents = nil
+			result = append(result, ref)
+		}
+		covered = unionExtents(covered, original.Extents)
+	}
+	for _, original := range current {
+		visible := subtractExtents(original.Extents, covered)
+		if len(visible) == 0 {
+			continue
+		}
+		ref := original
+		ref.Extents = visible
+		ref.ZeroExtents = nil
+		result = append(result, ref)
+	}
+	return result
+}
+
+func cloneObjectRefs(refs []ObjectRef) []ObjectRef {
+	cloned := make([]ObjectRef, len(refs))
+	for index, original := range refs {
+		cloned[index] = original
+		cloned[index].Extents = append([]Extent(nil), original.Extents...)
+		cloned[index].ZeroExtents = append([]Extent(nil), original.ZeroExtents...)
+		cloned[index].InlineData = append([]byte(nil), original.InlineData...)
+	}
+	return cloned
+}
+
+func cloneState(state State) State {
+	cloned := state
+	if state.Lease != nil {
+		lease := *state.Lease
+		cloned.Lease = &lease
+	}
+	if state.InlineManifests != nil {
+		cloned.InlineManifests = make(map[string]json.RawMessage, len(state.InlineManifests))
+		for key, body := range state.InlineManifests {
+			cloned.InlineManifests[key] = append(json.RawMessage(nil), body...)
+		}
+	}
+	if state.ManifestBundle != nil {
+		bundle := *state.ManifestBundle
+		cloned.ManifestBundle = &bundle
+	}
+	return cloned
+}
+
 func (l *Lease) Release(ctx context.Context) error {
+	if err := l.waitForManifestBundle(ctx); err != nil {
+		return err
+	}
 	return l.update(ctx, func(state *State) error {
 		state.Lease = nil
 		return nil
 	})
+}
+
+func (l *Lease) waitForManifestBundle(ctx context.Context) error {
+	l.mu.Lock()
+	done := l.bundleDone
+	l.mu.Unlock()
+	if done == nil {
+		return nil
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (r *Remote) Break(ctx context.Context, name, expectedToken string) error {
@@ -503,6 +1121,7 @@ func (r *Remote) RestoreWithOptions(ctx context.Context, name, path string, opts
 type manifestEntry struct {
 	key      string
 	manifest Manifest
+	bundle   string
 }
 
 func (r *Remote) selectHistory(ctx context.Context, state State, opts RestoreOptions) (manifestEntry, error) {
@@ -528,19 +1147,20 @@ func (r *Remote) loadHistory(ctx context.Context, state State) ([]manifestEntry,
 	if state.Generation == 0 {
 		return nil, nil
 	}
+	var history []manifestEntry
+	bundles := make(map[string]manifestBundle)
 	key := state.Manifest
 	expectedGeneration := state.Generation
 	allowMissingParent := false
-	var history []manifestEntry
 	for key != "" {
-		manifest, err := r.readManifest(ctx, state, key, expectedGeneration)
+		manifest, bundle, err := r.readManifestWithSourceCache(ctx, state, key, expectedGeneration, bundles)
 		if errors.Is(err, objectstore.ErrNotFound) && allowMissingParent {
 			break
 		}
 		if err != nil {
 			return nil, err
 		}
-		history = append(history, manifestEntry{key: key, manifest: manifest})
+		history = append(history, manifestEntry{key: key, manifest: manifest, bundle: bundle})
 		if manifest.Generation == 1 {
 			if manifest.Parent != "" {
 				return nil, fmt.Errorf("generation one manifest %s has a parent", key)
@@ -561,35 +1181,202 @@ func (r *Remote) loadHistory(ctx context.Context, state State) ([]manifestEntry,
 }
 
 func (r *Remote) readManifest(ctx context.Context, state State, key string, expectedGeneration uint64) (Manifest, error) {
+	manifest, _, err := r.readManifestWithSource(ctx, state, key, expectedGeneration)
+	return manifest, err
+}
+
+func (r *Remote) readManifestWithSource(
+	ctx context.Context,
+	state State,
+	key string,
+	expectedGeneration uint64,
+) (Manifest, string, error) {
+	return r.readManifestWithSourceCache(ctx, state, key, expectedGeneration, make(map[string]manifestBundle))
+}
+
+func (r *Remote) readManifestWithSourceCache(
+	ctx context.Context,
+	state State,
+	key string,
+	expectedGeneration uint64,
+	bundles map[string]manifestBundle,
+) (Manifest, string, error) {
+	body, ok := state.InlineManifests[key]
+	if ok {
+		manifest, err := decodeManifest(state, key, body, expectedGeneration)
+		return manifest, "", err
+	}
+	bundleRef := state.ManifestBundle
+	for bundleRef != nil && expectedGeneration != 0 && expectedGeneration <= bundleRef.LastGeneration {
+		bundle, exists := bundles[bundleRef.Key]
+		if !exists {
+			var err error
+			bundle, err = r.readManifestBundle(ctx, state, *bundleRef)
+			if err != nil {
+				return Manifest{}, "", err
+			}
+			bundles[bundleRef.Key] = bundle
+		}
+		if expectedGeneration >= bundleRef.FirstGeneration {
+			for _, entry := range bundle.Manifests {
+				if entry.Key == key {
+					manifest, err := decodeManifest(state, key, entry.Body, expectedGeneration)
+					return manifest, bundleRef.Key, err
+				}
+			}
+			break
+		}
+		bundleRef = bundle.Parent
+	}
 	obj, err := r.Store.Get(ctx, key)
 	if err != nil {
-		return Manifest{}, fmt.Errorf("read manifest %s: %w", key, err)
+		return Manifest{}, "", fmt.Errorf("read manifest %s: %w", key, err)
 	}
-	var manifest Manifest
-	if err := json.Unmarshal(obj.Data, &manifest); err != nil {
-		return Manifest{}, fmt.Errorf("decode manifest %s: %w", key, err)
+	manifest, err := decodeManifest(state, key, obj.Data, expectedGeneration)
+	return manifest, "", err
+}
+
+func (r *Remote) readManifestBundle(ctx context.Context, state State, ref ManifestBundleRef) (manifestBundle, error) {
+	obj, err := r.Store.Get(ctx, ref.Key)
+	if err != nil {
+		return manifestBundle{}, fmt.Errorf("read manifest bundle %s: %w", ref.Key, err)
 	}
 	hash := sha256.Sum256(obj.Data)
+	wantKey := VolumePrefix(state.Name) + "manifest-bundles/" + hex.EncodeToString(hash[:]) + ".json"
+	if ref.Key != wantKey {
+		return manifestBundle{}, fmt.Errorf("manifest bundle %s checksum mismatch", ref.Key)
+	}
+	var bundle manifestBundle
+	if err := json.Unmarshal(obj.Data, &bundle); err != nil {
+		return manifestBundle{}, fmt.Errorf("decode manifest bundle %s: %w", ref.Key, err)
+	}
+	if bundle.Format != Format || bundle.VolumeID != state.ID || bundle.FirstGeneration != ref.FirstGeneration ||
+		bundle.LastGeneration != ref.LastGeneration || len(bundle.Manifests) == 0 {
+		return manifestBundle{}, fmt.Errorf("invalid manifest bundle %s", ref.Key)
+	}
+	if bundle.Parent != nil {
+		if !validManifestBundleRef(state.Name, *bundle.Parent) || bundle.Parent.LastGeneration >= bundle.FirstGeneration {
+			return manifestBundle{}, fmt.Errorf("manifest bundle %s has an invalid parent", ref.Key)
+		}
+	}
+	var first, previous uint64
+	for index, entry := range bundle.Manifests {
+		manifest, err := decodeManifest(state, entry.Key, entry.Body, 0)
+		if err != nil {
+			return manifestBundle{}, fmt.Errorf("validate manifest bundle %s: %w", ref.Key, err)
+		}
+		if manifest.Generation < bundle.FirstGeneration || manifest.Generation > bundle.LastGeneration ||
+			index > 0 && manifest.Generation <= previous {
+			return manifestBundle{}, fmt.Errorf("manifest bundle %s has unordered generations", ref.Key)
+		}
+		if index == 0 {
+			first = manifest.Generation
+		}
+		previous = manifest.Generation
+	}
+	if first != bundle.FirstGeneration || previous != bundle.LastGeneration {
+		return manifestBundle{}, fmt.Errorf("manifest bundle %s has an invalid generation range", ref.Key)
+	}
+	return bundle, nil
+}
+
+func decodeManifest(state State, key string, body []byte, expectedGeneration uint64) (Manifest, error) {
+	var manifest Manifest
+	if err := json.Unmarshal(body, &manifest); err != nil {
+		return Manifest{}, fmt.Errorf("decode manifest %s: %w", key, err)
+	}
+	hash := sha256.Sum256(body)
 	wantKey := VolumePrefix(state.Name) + "manifests/" + hex.EncodeToString(hash[:]) + ".json"
 	if key != wantKey {
 		return Manifest{}, fmt.Errorf("manifest %s checksum mismatch", key)
 	}
+	if expectedGeneration == 0 {
+		expectedGeneration = manifest.Generation
+	}
+	if err := validateManifest(state, key, manifest, expectedGeneration); err != nil {
+		return Manifest{}, err
+	}
+	return manifest, nil
+}
+
+func validateManifest(state State, label string, manifest Manifest, expectedGeneration uint64) error {
 	if manifest.Format != Format || manifest.VolumeID != state.ID || manifest.Epoch == 0 {
-		return Manifest{}, fmt.Errorf("manifest %s does not belong to volume %s", key, state.Name)
+		return fmt.Errorf("manifest %s does not belong to volume %s", label, state.Name)
 	}
 	if manifest.Generation != expectedGeneration || expectedGeneration == 0 {
-		return Manifest{}, fmt.Errorf("manifest %s breaks the generation chain", key)
+		return fmt.Errorf("manifest %s breaks the generation chain", label)
 	}
 	switch manifest.Kind {
 	case "delta":
-		if len(manifest.Segments) != 1 {
-			return Manifest{}, fmt.Errorf("delta manifest %s has %d segments", key, len(manifest.Segments))
+		if len(manifest.Segments) == 0 {
+			return fmt.Errorf("delta manifest %s has no segments", label)
 		}
 	case "checkpoint":
 	default:
-		return Manifest{}, fmt.Errorf("manifest %s has unknown kind %q", key, manifest.Kind)
+		return fmt.Errorf("manifest %s has unknown kind %q", label, manifest.Kind)
 	}
-	return manifest, nil
+	maxBlocks := uint64(state.Size / state.BlockSize)
+	var manifestExtents []Extent
+	var manifestBlocks uint64
+	for index, ref := range manifest.Segments {
+		if ref.Bytes <= 0 || ref.Blocks <= 0 || uint64(ref.Blocks) > maxBlocks || len(ref.Extents) == 0 {
+			return fmt.Errorf("manifest %s has an invalid segment reference at index %d", label, index)
+		}
+		digest, err := hex.DecodeString(ref.SHA256)
+		if err != nil || len(digest) != sha256.Size {
+			return fmt.Errorf("manifest %s has an invalid segment digest at index %d", label, index)
+		}
+		segmentPrefix := VolumePrefix(state.Name) + "segments/"
+		manifestPrefix := VolumePrefix(state.Name) + "manifests/"
+		storageKinds := 0
+		if ref.Key != "" {
+			storageKinds++
+			if !strings.HasPrefix(ref.Key, segmentPrefix) || !strings.HasSuffix(ref.Key, "-"+ref.SHA256+".seg.gz") {
+				return fmt.Errorf("manifest %s has an invalid segment key %s", label, ref.Key)
+			}
+		}
+		if len(ref.InlineData) != 0 {
+			storageKinds++
+			digest := sha256.Sum256(ref.InlineData)
+			if int64(len(ref.InlineData)) != ref.Bytes || hex.EncodeToString(digest[:]) != ref.SHA256 {
+				return fmt.Errorf("manifest %s has invalid inline segment data at index %d", label, index)
+			}
+		}
+		if ref.SourceManifest != "" {
+			storageKinds++
+			if !strings.HasPrefix(ref.SourceManifest, manifestPrefix) || !strings.HasSuffix(ref.SourceManifest, ".json") {
+				return fmt.Errorf("manifest %s has an invalid inline segment source %s", label, ref.SourceManifest)
+			}
+			if ref.SourceBundle != "" {
+				bundlePrefix := VolumePrefix(state.Name) + "manifest-bundles/"
+				if !strings.HasPrefix(ref.SourceBundle, bundlePrefix) || !strings.HasSuffix(ref.SourceBundle, ".json") {
+					return fmt.Errorf("manifest %s has an invalid segment source bundle %s", label, ref.SourceBundle)
+				}
+			}
+		} else if ref.SourceBundle != "" {
+			return fmt.Errorf("manifest %s has a segment bundle without a source manifest", label)
+		}
+		if storageKinds != 1 {
+			return fmt.Errorf("manifest %s has invalid segment storage at index %d", label, index)
+		}
+		blocks, err := validateExtents(ref.Extents, maxBlocks)
+		if err != nil || blocks > uint64(ref.Blocks) || manifest.Kind == "delta" && blocks != uint64(ref.Blocks) {
+			return fmt.Errorf("manifest %s has invalid segment extents at index %d", label, index)
+		}
+		if _, err := validateExtents(ref.ZeroExtents, maxBlocks); err != nil || !extentsContain(ref.Extents, ref.ZeroExtents) {
+			return fmt.Errorf("manifest %s has invalid zero extents at index %d", label, index)
+		}
+		if manifestBlocks > ^uint64(0)-blocks {
+			return fmt.Errorf("manifest %s extent count overflows", label)
+		}
+		manifestBlocks += blocks
+		manifestExtents = append(manifestExtents, ref.Extents...)
+	}
+	coveredBlocks, err := validateExtents(unionExtents(nil, manifestExtents), maxBlocks)
+	if err != nil || coveredBlocks != manifestBlocks {
+		return fmt.Errorf("manifest %s has overlapping segment extents", label)
+	}
+	return nil
 }
 
 // CollectGarbage marks objects outside the retained history, then deletes
@@ -604,7 +1391,7 @@ func (l *Lease) CollectGarbage(ctx context.Context, opts GCOptions) (GCResult, e
 		l.mu.Unlock()
 		return GCResult{}, ErrLeaseLost
 	}
-	state := l.state
+	state := cloneState(l.state)
 	l.mu.Unlock()
 	return l.remote.collectGarbage(ctx, state, opts)
 }
@@ -625,9 +1412,22 @@ func (r *Remote) collectGarbage(ctx context.Context, state State, opts GCOptions
 			}
 		}
 		for _, entry := range history[:keepThrough+1] {
-			keep[entry.key] = struct{}{}
+			if entry.key != "" {
+				keep[entry.key] = struct{}{}
+			}
+			if entry.bundle != "" {
+				keep[entry.bundle] = struct{}{}
+			}
 			for _, ref := range entry.manifest.Segments {
-				keep[ref.Key] = struct{}{}
+				if ref.Key != "" {
+					keep[ref.Key] = struct{}{}
+				}
+				if ref.SourceManifest != "" {
+					keep[ref.SourceManifest] = struct{}{}
+				}
+				if ref.SourceBundle != "" {
+					keep[ref.SourceBundle] = struct{}{}
+				}
 			}
 		}
 	}
@@ -716,33 +1516,21 @@ func (r *Remote) collectGarbage(ctx context.Context, state State, opts GCOptions
 }
 
 func isImmutableObject(prefix, key string) bool {
-	return strings.HasPrefix(key, prefix+"manifests/") || strings.HasPrefix(key, prefix+"segments/")
+	return strings.HasPrefix(key, prefix+"manifests/") || strings.HasPrefix(key, prefix+"manifest-bundles/") ||
+		strings.HasPrefix(key, prefix+"segments/")
 }
 
-func (r *Remote) RestoreState(ctx context.Context, state State, path string) error {
-	if err := validateState(state.Name, state); err != nil {
-		return err
-	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o600)
-	if err != nil {
-		return err
-	}
-	if err := f.Truncate(state.Size); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	var manifests []Manifest
+func (r *Remote) restoreManifests(ctx context.Context, state State) ([]manifestEntry, error) {
+	var manifests []manifestEntry
+	bundles := make(map[string]manifestBundle)
 	key := state.Manifest
 	expectedGeneration := state.Generation
 	for key != "" {
-		manifest, err := r.readManifest(ctx, state, key, expectedGeneration)
+		manifest, bundle, err := r.readManifestWithSourceCache(ctx, state, key, expectedGeneration, bundles)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		manifests = append(manifests, manifest)
+		manifests = append(manifests, manifestEntry{key: key, manifest: manifest, bundle: bundle})
 		if manifest.Kind == "checkpoint" {
 			expectedGeneration = 0
 			break
@@ -750,29 +1538,218 @@ func (r *Remote) RestoreState(ctx context.Context, state State, path string) err
 		expectedGeneration--
 		key = manifest.Parent
 		if len(manifests) > 1_000_000 {
-			return errors.New("manifest chain is too long")
+			return nil, errors.New("manifest chain is too long")
 		}
 	}
 	if expectedGeneration != 0 {
-		return errors.New("manifest chain ended before generation zero")
+		return nil, errors.New("manifest chain ended before generation zero")
 	}
-	for i := len(manifests) - 1; i >= 0; i-- {
-		for _, ref := range manifests[i].Segments {
-			wantKey := segmentKey(state.Name, manifests[i].Epoch, manifests[i].Generation, ref.SHA256)
-			if ref.Key != wantKey {
-				return fmt.Errorf("segment reference %s has an invalid key", ref.Key)
+	return manifests, nil
+}
+
+// restorePlan selects the newest non-zero value for every referenced block.
+// Its references are disjoint, so a checkpoint can reuse them without copying
+// segment data and a restore can skip overwritten segments.
+func (r *Remote) restorePlan(ctx context.Context, state State) ([]ObjectRef, error) {
+	manifests, err := r.restoreManifests(ctx, state)
+	if err != nil {
+		return nil, err
+	}
+	var covered []Extent
+	refs := make([]ObjectRef, 0)
+	for _, entry := range manifests {
+		var manifestExtents []Extent
+		for index, original := range entry.manifest.Segments {
+			if len(original.InlineData) != 0 && entry.key != "" {
+				original.SourceManifest = entry.key
+				original.SourceBundle = entry.bundle
+				original.SourceIndex = uint32(index)
 			}
-			obj, err := r.Store.Get(ctx, ref.Key)
-			if err != nil {
-				return fmt.Errorf("read segment %s: %w", ref.Key, err)
+			visible := subtractExtents(original.Extents, covered)
+			nonZero := subtractExtents(visible, original.ZeroExtents)
+			if len(nonZero) > 0 {
+				ref := original
+				ref.Extents = nonZero
+				ref.ZeroExtents = nil
+				refs = append(refs, ref)
 			}
-			segment := Segment{Data: obj.Data, SHA256: ref.SHA256, Bytes: ref.Bytes, Blocks: ref.Blocks}
-			if err := ApplySegment(path, state.Size, segment); err != nil {
-				return fmt.Errorf("apply segment %s: %w", ref.Key, err)
-			}
+			manifestExtents = append(manifestExtents, original.Extents...)
+		}
+		covered = unionExtents(covered, manifestExtents)
+	}
+	return refs, nil
+}
+
+func createSparseImage(path string, size int64) (*os.File, error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := f.Truncate(size); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return f, nil
+}
+
+type manifestSourceLoader struct {
+	store    objectstore.Store
+	volumeID string
+	mu       sync.Mutex
+	bundles  map[string]manifestBundle
+}
+
+func newManifestSourceLoader(store objectstore.Store, volumeID string) *manifestSourceLoader {
+	return &manifestSourceLoader{store: store, volumeID: volumeID, bundles: make(map[string]manifestBundle)}
+}
+
+func (l *manifestSourceLoader) manifestBody(ctx context.Context, bundleKey, manifestKey string) ([]byte, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	bundle, ok := l.bundles[bundleKey]
+	if !ok {
+		obj, err := l.store.Get(ctx, bundleKey)
+		if err != nil {
+			return nil, fmt.Errorf("read manifest bundle %s: %w", bundleKey, err)
+		}
+		digest := sha256.Sum256(obj.Data)
+		if !strings.HasSuffix(bundleKey, "/manifest-bundles/"+hex.EncodeToString(digest[:])+".json") {
+			return nil, fmt.Errorf("manifest bundle %s checksum mismatch", bundleKey)
+		}
+		if err := json.Unmarshal(obj.Data, &bundle); err != nil {
+			return nil, fmt.Errorf("decode manifest bundle %s: %w", bundleKey, err)
+		}
+		if bundle.Format != Format || bundle.VolumeID != l.volumeID || len(bundle.Manifests) == 0 {
+			return nil, fmt.Errorf("invalid manifest bundle %s", bundleKey)
+		}
+		l.bundles[bundleKey] = bundle
+	}
+	for _, entry := range bundle.Manifests {
+		if entry.Key == manifestKey {
+			return entry.Body, nil
 		}
 	}
+	return nil, fmt.Errorf("manifest %s is absent from bundle %s", manifestKey, bundleKey)
+}
+
+func applyObjectRef(
+	ctx context.Context,
+	store objectstore.Store,
+	sources *manifestSourceLoader,
+	f *os.File,
+	size int64,
+	ref ObjectRef,
+) error {
+	data := ref.InlineData
+	label := ref.Key
+	if len(data) == 0 && ref.SourceManifest != "" {
+		var sourceBody []byte
+		var err error
+		if ref.SourceBundle != "" {
+			sourceBody, err = sources.manifestBody(ctx, ref.SourceBundle, ref.SourceManifest)
+		} else {
+			var obj objectstore.Object
+			obj, err = store.Get(ctx, ref.SourceManifest)
+			sourceBody = obj.Data
+		}
+		if err != nil {
+			return fmt.Errorf("read inline segment manifest %s: %w", ref.SourceManifest, err)
+		}
+		digest := sha256.Sum256(sourceBody)
+		if !strings.HasSuffix(ref.SourceManifest, "/manifests/"+hex.EncodeToString(digest[:])+".json") {
+			return fmt.Errorf("inline segment manifest %s checksum mismatch", ref.SourceManifest)
+		}
+		var source Manifest
+		if err := json.Unmarshal(sourceBody, &source); err != nil {
+			return fmt.Errorf("decode inline segment manifest %s: %w", ref.SourceManifest, err)
+		}
+		if int(ref.SourceIndex) >= len(source.Segments) {
+			return fmt.Errorf("inline segment index %d is outside manifest %s", ref.SourceIndex, ref.SourceManifest)
+		}
+		sourceRef := source.Segments[ref.SourceIndex]
+		if len(sourceRef.InlineData) == 0 || sourceRef.SHA256 != ref.SHA256 || sourceRef.Bytes != ref.Bytes || sourceRef.Blocks != ref.Blocks {
+			return fmt.Errorf("inline segment %d in manifest %s does not match its reference", ref.SourceIndex, ref.SourceManifest)
+		}
+		data = sourceRef.InlineData
+		label = fmt.Sprintf("%s[%d]", ref.SourceManifest, ref.SourceIndex)
+	} else if len(data) == 0 {
+		obj, err := store.Get(ctx, ref.Key)
+		if err != nil {
+			return fmt.Errorf("read segment %s: %w", ref.Key, err)
+		}
+		data = obj.Data
+	}
+	segment := Segment{Data: data, SHA256: ref.SHA256, Bytes: ref.Bytes, Blocks: ref.Blocks}
+	runs, err := decodeSegment(segment)
+	if err != nil {
+		return fmt.Errorf("decode segment %s: %w", label, err)
+	}
+	actual := make([]Extent, len(runs))
+	for i, run := range runs {
+		actual[i] = run.extent
+	}
+	if !extentsContain(actual, ref.Extents) {
+		return fmt.Errorf("segment %s does not contain its manifest extents", label)
+	}
+	if err := applyRuns(f, size, runs, ref.Extents); err != nil {
+		return fmt.Errorf("apply segment %s: %w", label, err)
+	}
 	return nil
+}
+
+func applyObjectRefs(ctx context.Context, store objectstore.Store, volumeID string, f *os.File, size int64, refs []ObjectRef) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	sources := newManifestSourceLoader(store, volumeID)
+	jobs := make(chan ObjectRef)
+	var firstErr error
+	var errOnce sync.Once
+	workers := min(4, len(refs))
+	var group sync.WaitGroup
+	group.Add(workers)
+	for range workers {
+		go func() {
+			defer group.Done()
+			for ref := range jobs {
+				if err := applyObjectRef(ctx, store, sources, f, size, ref); err != nil {
+					errOnce.Do(func() {
+						firstErr = err
+						cancel()
+					})
+				}
+			}
+		}()
+	}
+sendLoop:
+	for _, ref := range refs {
+		select {
+		case jobs <- ref:
+		case <-ctx.Done():
+			break sendLoop
+		}
+	}
+	close(jobs)
+	group.Wait()
+	if firstErr != nil {
+		return firstErr
+	}
+	return ctx.Err()
+}
+
+func (r *Remote) RestoreState(ctx context.Context, state State, path string) error {
+	if err := validateState(state.Name, state); err != nil {
+		return err
+	}
+	refs, err := r.restorePlan(ctx, state)
+	if err != nil {
+		return err
+	}
+	f, err := createSparseImage(path, state.Size)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return applyObjectRefs(ctx, r.Store, state.ID, f, state.Size, refs)
 }
 
 func (r *Remote) Exists(ctx context.Context, name string) (bool, error) {

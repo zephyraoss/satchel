@@ -48,7 +48,8 @@ type Mount struct {
 	attachment *Attachment
 	mountpoint string
 	log        *slog.Logger
-	once       sync.Once
+	mu         sync.Mutex
+	closed     bool
 }
 
 func (b *Backend) Mount(ctx context.Context, device *replica.Device, mountpoint string, opts backend.MountOptions) (backend.Unmounter, error) {
@@ -87,27 +88,31 @@ func (m *Mount) Abandon() error {
 }
 
 func (m *Mount) close(ctx context.Context, detach bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return nil
+	}
+	flags := 0
+	if detach {
+		flags = syscall.MNT_DETACH
+	}
+	if err := unmount(ctx, m.mountpoint, flags); err != nil && !detach {
+		return err
+	}
 	var result error
-	m.once.Do(func() {
-		flags := 0
-		if detach {
-			flags = syscall.MNT_DETACH
-		}
-		if err := unmount(ctx, m.mountpoint, flags); err != nil {
-			result = err
-		}
-		if err := m.attachment.Close(); err != nil && result == nil {
-			result = err
-		}
-		if err := os.Remove(m.mountpoint); err != nil && !errors.Is(err, os.ErrNotExist) && result == nil {
-			result = err
-		}
-	})
+	if err := m.attachment.Close(); err != nil {
+		result = err
+	}
+	if err := os.Remove(m.mountpoint); err != nil && !errors.Is(err, os.ErrNotExist) && result == nil {
+		result = err
+	}
+	m.closed = true
 	return result
 }
 
 func unmount(ctx context.Context, mountpoint string, flags int) error {
-	deadline := time.NewTimer(5 * time.Second)
+	deadline := time.NewTimer(30 * time.Second)
 	defer deadline.Stop()
 	for {
 		err := syscall.Unmount(mountpoint, flags)

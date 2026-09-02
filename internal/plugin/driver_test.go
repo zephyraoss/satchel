@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -43,6 +44,36 @@ type fakeUnmount struct{}
 
 func (fakeUnmount) Unmount(context.Context) error { return nil }
 func (fakeUnmount) Abandon() error                { return nil }
+
+type blockingManifestStore struct {
+	objectstore.Store
+	block   atomic.Bool
+	started chan struct{}
+	release chan struct{}
+}
+
+type countingListStore struct {
+	objectstore.Store
+	lists atomic.Int64
+}
+
+func (s *countingListStore) List(ctx context.Context, prefix string) ([]string, error) {
+	s.lists.Add(1)
+	return s.Store.List(ctx, prefix)
+}
+
+func (s *blockingManifestStore) PutIfAbsent(ctx context.Context, key string, data []byte) (string, error) {
+	checkpoint := strings.Contains(key, "/manifests/") && bytes.Contains(data, []byte(`"kind":"checkpoint"`))
+	if checkpoint && s.block.CompareAndSwap(true, false) {
+		close(s.started)
+		select {
+		case <-s.release:
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+	return s.Store.PutIfAbsent(ctx, key, data)
+}
 
 func newTestDriver(t *testing.T, store objectstore.Store, node string) (*Driver, *fakeBackend) {
 	t.Helper()
@@ -98,7 +129,9 @@ func TestVolumeReplicatesBlockChanges(t *testing.T) {
 }
 
 func TestFilesystemFlushPublishesRemoteGeneration(t *testing.T) {
-	store := objectstore.NewMemory()
+	store := &blockingManifestStore{
+		Store: objectstore.NewMemory(), started: make(chan struct{}), release: make(chan struct{}),
+	}
 	driver, backend := newTestDriver(t, store, "node-a")
 	if err := driver.Create(&volume.CreateRequest{Name: "data", Options: map[string]string{"size": "64MiB"}}); err != nil {
 		t.Fatal(err)
@@ -113,16 +146,23 @@ func TestFilesystemFlushPublishesRemoteGeneration(t *testing.T) {
 	if _, err := backend.device.WriteAt([]byte("committed"), 4*replica.DefaultBlockSize); err != nil {
 		t.Fatal(err)
 	}
+	store.block.Store(true)
 	if err := backend.device.Flush(); err != nil {
 		t.Fatal(err)
+	}
+	select {
+	case <-store.started:
+	case <-time.After(time.Second):
+		t.Fatal("background checkpoint did not start")
 	}
 	after, _, err := driver.remote.Inspect(context.Background(), "data")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if after.Generation <= before.Generation || after.Checkpoint != after.Generation {
-		t.Fatalf("state after flush = %+v, want a published generation and checkpoint", after)
+	if after.Generation <= before.Generation {
+		t.Fatalf("state after flush = %+v, want a published generation", after)
 	}
+	close(store.release)
 	if err := driver.Unmount(&volume.UnmountRequest{Name: "data", ID: "container"}); err != nil {
 		t.Fatal(err)
 	}
@@ -160,6 +200,23 @@ func TestAsyncDurabilityDoesNotBlockFlushOnS3(t *testing.T) {
 	}
 }
 
+func TestUnmountDoesNotRunGarbageCollection(t *testing.T) {
+	store := &countingListStore{Store: objectstore.NewMemory()}
+	driver, _ := newTestDriver(t, store, "node-a")
+	if err := driver.Create(&volume.CreateRequest{Name: "data", Options: map[string]string{"size": "64MiB"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := driver.Mount(&volume.MountRequest{Name: "data", ID: "container"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := driver.Unmount(&volume.UnmountRequest{Name: "data", ID: "container"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.lists.Load(); got != 0 {
+		t.Fatalf("unmount listed object history %d times", got)
+	}
+}
+
 func TestSecondNodeCannotMountHeldVolume(t *testing.T) {
 	store := objectstore.NewMemory()
 	first, _ := newTestDriver(t, store, "node-a")
@@ -187,13 +244,13 @@ func TestSecondNodeCannotMountHeldVolume(t *testing.T) {
 	}
 }
 
-type failSegmentStore struct {
+type failStateStore struct {
 	objectstore.Store
-	fail bool
+	fail atomic.Bool
 }
 
-func TestFailedRemoteFlushCanBeRetried(t *testing.T) {
-	store := &failSegmentStore{Store: objectstore.NewMemory()}
+func TestTransientRemoteFlushFailureStallsThenSucceeds(t *testing.T) {
+	store := &failStateStore{Store: objectstore.NewMemory()}
 	driver, backend := newTestDriver(t, store, "node-a")
 	if err := driver.Create(&volume.CreateRequest{Name: "data", Options: map[string]string{"size": "64MiB"}}); err != nil {
 		t.Fatal(err)
@@ -204,13 +261,12 @@ func TestFailedRemoteFlushCanBeRetried(t *testing.T) {
 	if _, err := backend.device.WriteAt([]byte("committed"), 4*replica.DefaultBlockSize); err != nil {
 		t.Fatal(err)
 	}
-	store.fail = true
-	if err := backend.device.Flush(); err == nil {
-		t.Fatal("flush succeeded while the object store was unavailable")
-	}
-	store.fail = false
+	store.fail.Store(true)
 	if err := backend.device.Flush(); err != nil {
-		t.Fatalf("retry flush: %v", err)
+		t.Fatalf("flush should stall through a transient outage and succeed, got: %v", err)
+	}
+	if store.fail.Load() {
+		t.Fatal("flush did not exercise the injected transient failure")
 	}
 
 	path := filepath.Join(t.TempDir(), "restored")
@@ -234,21 +290,22 @@ func TestFailedRemoteFlushCanBeRetried(t *testing.T) {
 	}
 }
 
-func (s *failSegmentStore) PutIfAbsent(ctx context.Context, key string, data []byte) (string, error) {
-	if s.fail && strings.Contains(key, "/segments/") {
-		return "", errors.New("injected segment upload failure")
+func (s *failStateStore) PutIfMatch(ctx context.Context, key string, data []byte, etag string) (string, error) {
+	if strings.HasSuffix(key, "/state.json") && s.fail.CompareAndSwap(true, false) {
+		return "", errors.New("injected state update failure")
 	}
-	return s.Store.PutIfAbsent(ctx, key, data)
+	return s.Store.PutIfMatch(ctx, key, data, etag)
 }
 
 func TestInitialPublishFailureRollsBackMount(t *testing.T) {
-	store := &failSegmentStore{Store: objectstore.NewMemory(), fail: true}
+	store := &failStateStore{Store: objectstore.NewMemory()}
+	store.fail.Store(true)
 	driver, _ := newTestDriver(t, store, "node-a")
 	if err := driver.Create(&volume.CreateRequest{Name: "data", Options: map[string]string{"size": "64MiB"}}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := driver.Mount(&volume.MountRequest{Name: "data", ID: "container"}); err == nil {
-		t.Fatal("mount succeeded despite the segment upload failure")
+		t.Fatal("mount succeeded despite the state update failure")
 	}
 
 	state := driver.volumes["data"]
@@ -267,7 +324,6 @@ func TestInitialPublishFailureRollsBackMount(t *testing.T) {
 	if remoteState.Lease != nil {
 		t.Fatal("failed mount retained its lease")
 	}
-	store.fail = false
 	if _, err := driver.Mount(&volume.MountRequest{Name: "data", ID: "container"}); err != nil {
 		t.Fatalf("retry mount: %v", err)
 	}

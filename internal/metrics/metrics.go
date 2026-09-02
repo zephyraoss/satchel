@@ -27,13 +27,34 @@ var (
 	}, []string{"reason"})
 	SyncDuration = promauto.NewHistogram(prometheus.HistogramOpts{
 		Name:    "satchel_sync_duration_seconds",
-		Help:    "Time spent publishing, checkpointing, and collecting garbage at unmount.",
+		Help:    "Time spent publishing and checkpointing at unmount.",
 		Buckets: prometheus.ExponentialBuckets(0.1, 2, 10),
 	})
 	RestoreDuration = promauto.NewHistogram(prometheus.HistogramOpts{
 		Name:    "satchel_restore_duration_seconds",
-		Help:    "Time spent restoring block generations at mount.",
+		Help:    "Time spent preparing a writable lazy image or materializing a read-only image at mount.",
 		Buckets: prometheus.ExponentialBuckets(0.1, 2, 10),
+	})
+	ReplicationStageDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "satchel_replication_stage_duration_seconds",
+		Help:    "Time spent in each replication stage.",
+		Buckets: prometheus.ExponentialBuckets(0.001, 2, 14),
+	}, []string{"stage"})
+	ReplicationGenerations = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "satchel_replication_generations_total",
+		Help: "Block generations encoded for replication.",
+	})
+	ReplicationInputBytes = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "satchel_replication_input_bytes_total",
+		Help: "Uncompressed changed block bytes encoded for replication.",
+	})
+	ReplicationStoredBytes = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "satchel_replication_stored_bytes_total",
+		Help: "Compressed segment bytes produced for replication.",
+	})
+	ReplicationSegments = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "satchel_replication_segments_total",
+		Help: "Compressed segments produced for replication, including segments embedded in manifests.",
 	})
 )
 

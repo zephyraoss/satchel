@@ -377,6 +377,7 @@ func (d *Driver) mountFresh(ctx context.Context, state *volumeState, mount *moun
 	remoteState := lease.State()
 	initializing := remoteState.Generation == 0
 	started := time.Now()
+	var lazyImage *replica.LazyImage
 	if initializing {
 		file, err := os.OpenFile(imagePath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o600)
 		if err != nil {
@@ -390,16 +391,23 @@ func (d *Driver) mountFresh(ctx context.Context, state *volumeState, mount *moun
 		if err := d.backend.Format(setupCtx, imagePath, remoteState.Filesystem); err != nil {
 			return releaseOnFailure(err)
 		}
-	} else if err := d.remote.RestoreState(setupCtx, remoteState, imagePath); err != nil {
-		metrics.MountFailures.WithLabelValues("restore").Inc()
-		return releaseOnFailure(err)
+	} else {
+		lazyImage, err = lease.PrepareLazyRestore(setupCtx, imagePath)
+		if err != nil {
+			metrics.MountFailures.WithLabelValues("restore").Inc()
+			return releaseOnFailure(err)
+		}
 	}
 	metrics.RestoreDuration.Observe(time.Since(started).Seconds())
 
 	device, err := replica.OpenDevice(imagePath, remoteState.Size, d.cfg.MaxDirty)
 	if err != nil {
+		if lazyImage != nil {
+			_ = lazyImage.Close()
+		}
 		return releaseOnFailure(err)
 	}
+	device.SetLazyImage(lazyImage)
 	device.SetBackpressureHandler(func() {
 		metrics.BackpressureEvents.WithLabelValues(mount.name).Inc()
 	})
@@ -432,11 +440,11 @@ func (d *Driver) mountFresh(ctx context.Context, state *volumeState, mount *moun
 	}
 	if initializing {
 		generation := device.Seal()
-		segment, err := replica.EncodeSegment(generation)
+		segments, err := replica.EncodeSegments(generation, replica.DefaultSegmentBlocks)
 		if err != nil {
 			return cleanupMounted(err)
 		}
-		if err := lease.Publish(setupCtx, segment); err != nil {
+		if err := lease.Publish(setupCtx, segments...); err != nil {
 			return cleanupMounted(err)
 		}
 		device.Release(generation)
@@ -449,13 +457,16 @@ func (d *Driver) mountFresh(ctx context.Context, state *volumeState, mount *moun
 		go d.fence(state, mount, cause)
 	})
 	mount.syncer = syncer
+	dirtyThreshold := min(d.cfg.MaxDirty/4, int64(32<<20))
+	device.SetDirtyHandler(dirtyThreshold, syncer.Notify)
+	device.SetBackpressureHandler(func() {
+		metrics.BackpressureEvents.WithLabelValues(mount.name).Inc()
+		syncer.Notify()
+	})
 	if opts.RemoteDurability() {
-		device.SetFlushHandler(func() error {
-			if err := syncer.Sync(context.Background()); err != nil {
-				return fmt.Errorf("publish filesystem flush: %w", err)
-			}
-			return nil
-		})
+		device.SetRemoteFlushHandler(syncer.EnqueueGeneration)
+	} else {
+		device.SetAsyncFlush()
 	}
 	metrics.LeaseHeld.WithLabelValues(mount.name).Set(1)
 	d.log.Info("volume mounted", "volume", mount.name, "restore_took", time.Since(started))
@@ -544,17 +555,8 @@ func (d *Driver) unmountLast(ctx context.Context, mount *mountState) error {
 	}
 	if mount.syncer != nil {
 		started := time.Now()
-		if err := mount.syncer.Sync(ctx); err != nil {
+		if err := mount.syncer.SyncCheckpoint(ctx); err != nil {
 			return fmt.Errorf("final sync %s: %w", mount.name, err)
-		}
-		gcResult, err := mount.lease.CollectGarbage(ctx, replica.GCOptions{
-			HistoryRetention: d.cfg.HistoryRetention,
-			GracePeriod:      d.cfg.GCGrace,
-		})
-		if err != nil {
-			d.log.Warn("garbage collection deferred", "volume", mount.name, "err", err)
-		} else if gcResult.Marked != 0 || gcResult.Deleted != 0 {
-			d.log.Info("garbage collection complete", "volume", mount.name, "marked", gcResult.Marked, "deleted", gcResult.Deleted)
 		}
 		mount.stopBeat()
 		if err := mount.syncer.Stop(ctx); err != nil {
