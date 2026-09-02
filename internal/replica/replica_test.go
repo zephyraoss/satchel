@@ -1594,3 +1594,243 @@ func TestRemoteFlushFailsImmediatelyOnLeaseTakeover(t *testing.T) {
 		t.Fatalf("takeover should not retry, saw %d state attempts", got)
 	}
 }
+
+type lostAckStateStore struct {
+	objectstore.Store
+	mu          sync.Mutex
+	dropsLeft   int
+	getFailures int
+}
+
+func (s *lostAckStateStore) PutIfMatch(ctx context.Context, key string, data []byte, etag string) (string, error) {
+	newETag, err := s.Store.PutIfMatch(ctx, key, data, etag)
+	if err != nil || !strings.HasSuffix(key, "/state.json") {
+		return newETag, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.dropsLeft > 0 {
+		s.dropsLeft--
+		s.getFailures++
+		return "", errors.New("write state: connection reset while awaiting response")
+	}
+	return newETag, nil
+}
+
+func (s *lostAckStateStore) Get(ctx context.Context, key string) (objectstore.Object, error) {
+	if strings.HasSuffix(key, "/state.json") {
+		s.mu.Lock()
+		if s.getFailures > 0 {
+			s.getFailures--
+			s.mu.Unlock()
+			return objectstore.Object{}, errors.New("read state: connection reset")
+		}
+		s.mu.Unlock()
+	}
+	return s.Store.Get(ctx, key)
+}
+
+func TestPublishRetryAdoptsCommitAfterLostAck(t *testing.T) {
+	ctx := context.Background()
+	store := &lostAckStateStore{Store: objectstore.NewMemory(), dropsLeft: 1}
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	remote := &Remote{Store: store, TTL: 30 * time.Second, Now: func() time.Time { return now }}
+	lease, _, err := remote.Acquire(ctx, "data", "node-a", CreateOptions{Size: 8 * DefaultBlockSize})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := incompressibleBlock(t, 'a')
+	segment, err := EncodeSegment(&Generation{Blocks: map[uint64][]byte{1: first}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lease.Publish(ctx, segment); err == nil {
+		t.Fatal("first publish attempt should surface the lost ack")
+	}
+	now = now.Add(5 * time.Second)
+	if err := lease.Publish(ctx, segment); err != nil {
+		t.Fatalf("retried publish error = %v, want success", err)
+	}
+	if got := lease.State().Generation; got != 1 {
+		t.Fatalf("lease generation = %d, want 1", got)
+	}
+	state, _, err := remote.Inspect(ctx, "data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Generation != 1 {
+		t.Fatalf("remote generation = %d, want exactly one publish", state.Generation)
+	}
+	second := incompressibleBlock(t, 'b')
+	next, err := EncodeSegment(&Generation{Blocks: map[uint64][]byte{2: second}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lease.Publish(ctx, next); err != nil {
+		t.Fatalf("publish after adopted commit error = %v", err)
+	}
+	if err := lease.PublishCheckpoint(ctx); err != nil {
+		t.Fatalf("checkpoint after adopted commit error = %v", err)
+	}
+	restored := filepath.Join(t.TempDir(), "restored")
+	if _, err := remote.Restore(ctx, "data", restored); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(restored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(data[DefaultBlockSize:2*DefaultBlockSize], first) {
+		t.Fatal("block 1 did not round-trip through the adopted commit")
+	}
+	if !bytes.Equal(data[2*DefaultBlockSize:3*DefaultBlockSize], second) {
+		t.Fatal("block 2 did not round-trip after the adopted commit")
+	}
+}
+
+func TestPublishRetryAfterLostAckDetectsTakeover(t *testing.T) {
+	ctx := context.Background()
+	store := &lostAckStateStore{Store: objectstore.NewMemory(), dropsLeft: 1}
+	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	remote := &Remote{Store: store, TTL: 30 * time.Second, Now: func() time.Time { return now }}
+	first, _, err := remote.Acquire(ctx, "data", "node-a", CreateOptions{Size: 8 * DefaultBlockSize})
+	if err != nil {
+		t.Fatal(err)
+	}
+	segment, err := EncodeSegment(&Generation{Blocks: map[uint64][]byte{1: incompressibleBlock(t, 'a')}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Publish(ctx, segment); err == nil {
+		t.Fatal("first publish attempt should surface the lost ack")
+	}
+	now = now.Add(time.Minute)
+	second, created, err := remote.Acquire(ctx, "data", "node-b", CreateOptions{})
+	if err != nil || created {
+		t.Fatalf("takeover: created=%v err=%v", created, err)
+	}
+	if err := first.Publish(ctx, segment); !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("retried publish after takeover = %v, want ErrLeaseLost", err)
+	}
+	state, _, err := remote.Inspect(ctx, "data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Lease == nil || state.Lease.Token != second.State().Lease.Token {
+		t.Fatal("takeover lease was clobbered by the fenced retry")
+	}
+}
+
+func TestRemoteFlushRecoversFromLostPublishAck(t *testing.T) {
+	store := &lostAckStateStore{Store: objectstore.NewMemory(), dropsLeft: 1}
+	fenced := make(chan error, 1)
+	device, syncer := newFlushingSyncer(t, store, func(err error) { fenced <- err })
+	defer syncer.Abandon()
+	defer device.Close()
+
+	if _, err := device.WriteAt(incompressibleBlock(t, 'c'), 0); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- device.Flush() }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("flush after lost ack = %v, want success", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("flush never completed after the lost ack")
+	}
+
+	select {
+	case err := <-fenced:
+		t.Fatalf("volume fenced on a lost ack: %v", err)
+	default:
+	}
+	if got := syncer.lease.State().Generation; got != 1 {
+		t.Fatalf("generation = %d, want exactly one publish", got)
+	}
+}
+
+func largeExternalSegment(t *testing.T, extentCount int) Segment {
+	t.Helper()
+	body := []byte("encoded segment placeholder")
+	digest := sha256.Sum256(body)
+	extents := make([]Extent, extentCount)
+	for index := range extents {
+		extents[index] = Extent{Start: uint64(index * 2), Blocks: 1}
+	}
+	return Segment{
+		Data: body, SHA256: hex.EncodeToString(digest[:]), Bytes: int64(len(body)),
+		Blocks: int64(extentCount), Extents: extents,
+	}
+}
+
+func tornGCVolume(t *testing.T) (*Remote, *objectstore.Memory, *Lease, string, string) {
+	t.Helper()
+	ctx := context.Background()
+	store := objectstore.NewMemory()
+	remote := &Remote{Store: store}
+	const extentCount = 12_000
+	lease, _, err := remote.Acquire(ctx, "torn-gc", "node-a", CreateOptions{Size: 2 * extentCount * DefaultBlockSize})
+	if err != nil {
+		t.Fatal(err)
+	}
+	segment := largeExternalSegment(t, extentCount)
+	if err := lease.Publish(ctx, segment); err != nil {
+		t.Fatal(err)
+	}
+	expired := lease.State().Manifest
+	if !strings.Contains(expired, "/manifests/") {
+		t.Fatalf("generation one manifest is not external: %q", expired)
+	}
+	for range 2 {
+		if err := lease.Publish(ctx, segment); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := lease.PublishCheckpoint(ctx); err != nil {
+		t.Fatal(err)
+	}
+	checkpoint := lease.State().Manifest
+	if !strings.Contains(checkpoint, "/manifests/") {
+		t.Fatalf("checkpoint manifest is not external: %q", checkpoint)
+	}
+	if err := lease.Publish(ctx, segment); err != nil {
+		t.Fatal(err)
+	}
+	return remote, store, lease, expired, checkpoint
+}
+
+func TestHistoryToleratesManifestsRemovedByInterruptedGC(t *testing.T) {
+	ctx := context.Background()
+	remote, store, lease, expired, _ := tornGCVolume(t)
+	if err := store.Delete(ctx, expired); err != nil {
+		t.Fatal(err)
+	}
+	history, err := remote.loadHistory(ctx, lease.State())
+	if err != nil {
+		t.Fatalf("history walk failed on a gap behind the checkpoint: %v", err)
+	}
+	if len(history) != 4 {
+		t.Fatalf("history entries = %d, want 4 (walk truncated at the interrupted-sweep gap)", len(history))
+	}
+	if history[len(history)-1].manifest.Kind == "checkpoint" {
+		t.Fatal("the gap must sit below surviving deltas, not directly under the checkpoint")
+	}
+	if _, err := lease.CollectGarbage(ctx, GCOptions{}); err != nil {
+		t.Fatalf("garbage collection stayed wedged after an interrupted sweep: %v", err)
+	}
+}
+
+func TestHistoryFailsOnMissingManifestAboveNewestCheckpoint(t *testing.T) {
+	ctx := context.Background()
+	remote, store, lease, _, checkpoint := tornGCVolume(t)
+	if err := store.Delete(ctx, checkpoint); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := remote.loadHistory(ctx, lease.State()); !errors.Is(err, objectstore.ErrNotFound) {
+		t.Fatalf("missing restorable-chain manifest must fail the walk, got: %v", err)
+	}
+}

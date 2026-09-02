@@ -15,7 +15,7 @@ CYCLES=${1:-8}
 : "${SATCHEL_FAULT_VOLUME_SIZE:=8GiB}"
 : "${SATCHEL_FAULT_LOAD_MIN_SECONDS:=8}"
 : "${SATCHEL_FAULT_LOAD_MAX_SECONDS:=25}"
-: "${SATCHEL_FAULT_FAULTS:=pg satchel-break satchel-ttl s3-outage}"
+: "${SATCHEL_FAULT_FAULTS:=pg satchel-break satchel-ttl s3-outage satchel-checkpoint satchel-upload gc-kill}"
 : "${SATCHEL_FAULT_S3_OUTAGE_SECONDS:=30}"
 : "${SATCHEL_FAULT_S3_STOP:=systemctl stop minio}"
 : "${SATCHEL_FAULT_S3_START:=systemctl start minio}"
@@ -26,6 +26,9 @@ CYCLES=${1:-8}
 : "${SATCHEL_SYNC_INTERVAL:=1s}"
 : "${SATCHEL_DIRTY_LIMIT:=1GiB}"
 : "${SATCHEL_CHECKPOINT_INTERVAL:=64}"
+: "${SATCHEL_FAULT_CHECKPOINT_FAST_INTERVAL:=1}"
+: "${SATCHEL_FAULT_UPLOAD_BURST_MIB:=256}"
+: "${SATCHEL_FAULT_GC_GRACE:=0s}"
 
 run_root="$SATCHEL_FAULT_ROOT/$SATCHEL_FAULT_RUN_ID"
 volume=$SATCHEL_FAULT_VOLUME
@@ -38,6 +41,8 @@ pg_pid=
 pg_log=
 pg_running=0
 load_pids=()
+burst_pid=
+gc_pid=
 
 if [[ -e "$run_root" ]]; then
   echo "fault campaign already exists: $SATCHEL_FAULT_RUN_ID" >&2
@@ -78,6 +83,7 @@ satchel_cmd() {
 start_satchel() {
   local state_dir=$1
   local log_file=$2
+  local checkpoint_interval=${3:-$SATCHEL_CHECKPOINT_INTERVAL}
   install -d -m 0700 "$state_dir"
   env \
     SATCHEL_S3_ENDPOINT="$SATCHEL_S3_ENDPOINT" \
@@ -87,7 +93,7 @@ start_satchel() {
     SATCHEL_STATE_DIR="$state_dir" \
     SATCHEL_SYNC_INTERVAL="$SATCHEL_SYNC_INTERVAL" \
     SATCHEL_DIRTY_LIMIT="$SATCHEL_DIRTY_LIMIT" \
-    SATCHEL_CHECKPOINT_INTERVAL="$SATCHEL_CHECKPOINT_INTERVAL" \
+    SATCHEL_CHECKPOINT_INTERVAL="$checkpoint_interval" \
     "$SATCHEL_BIN" mount "$volume" \
       --size "$SATCHEL_FAULT_VOLUME_SIZE" \
       --durability remote \
@@ -268,6 +274,8 @@ initialize_database() {
 
 cleanup() {
   stop_load
+  if [[ -n "$burst_pid" ]]; then kill -9 "$burst_pid" 2>/dev/null || true; fi
+  if [[ -n "$gc_pid" ]]; then kill -9 "$gc_pid" 2>/dev/null || true; fi
   stop_postgres_clean
   stop_satchel_clean
 }
@@ -283,7 +291,12 @@ for ((cycle = 1; cycle <= CYCLES; cycle++)); do
   install -m 0644 -o postgres -g postgres /dev/null "$pg_log"
   log "cycle $cycle/$CYCLES fault=$fault"
 
-  start_satchel "$cycle_dir/state" "$cycle_dir/satchel.log" || fail "mount failed, see $cycle_dir/satchel.log"
+  mount_checkpoint_interval=$SATCHEL_CHECKPOINT_INTERVAL
+  if [[ "$fault" == satchel-checkpoint ]]; then
+    mount_checkpoint_interval=$SATCHEL_FAULT_CHECKPOINT_FAST_INTERVAL
+  fi
+  start_satchel "$cycle_dir/state" "$cycle_dir/satchel.log" "$mount_checkpoint_interval" || \
+    fail "mount failed, see $cycle_dir/satchel.log"
   pgdata="$mountpoint/pgdata"
   if [[ ! -f "$pgdata/PG_VERSION" ]]; then
     install -d -m 0700 -o postgres -g postgres "$pgdata"
@@ -349,6 +362,96 @@ for ((cycle = 1; cycle <= CYCLES; cycle++)); do
       verify_recovery "$cycle_dir" "$base_seq"
       stop_postgres_clean
       stop_satchel_clean
+      ;;
+    satchel-checkpoint)
+      sleep "0.$((RANDOM % 10))"
+      log "kill -9 satchel pid $satchel_pid with checkpoint interval $mount_checkpoint_interval"
+      kill_satchel_hard
+      kill_postgres_hard
+      force_unmount
+      satchel_cmd "$SATCHEL_BIN" vol lease break --yes "$volume" >>"$cycle_dir/lease-break.log" 2>&1 || \
+        fail "lease break failed, see $cycle_dir/lease-break.log"
+      start_satchel "$cycle_dir/takeover-state" "$cycle_dir/satchel-takeover.log" || \
+        fail "takeover mount failed, see $cycle_dir/satchel-takeover.log"
+      pgdata="$mountpoint/pgdata"
+      start_postgres
+      verify_recovery "$cycle_dir" "$base_seq"
+      stop_postgres_clean
+      stop_satchel_clean
+      ;;
+    satchel-upload)
+      log "dd ${SATCHEL_FAULT_UPLOAD_BURST_MIB}MiB burst to force large segment uploads"
+      dd if=/dev/urandom of="$mountpoint/upload-burst.bin" bs=4M \
+        count=$((SATCHEL_FAULT_UPLOAD_BURST_MIB / 4)) oflag=direct conv=fsync \
+        >"$cycle_dir/dd.log" 2>&1 &
+      burst_pid=$!
+      sleep "$((RANDOM % 3 + 1)).$((RANDOM % 10))"
+      log "kill -9 satchel pid $satchel_pid during upload burst"
+      kill_satchel_hard
+      kill -9 "$burst_pid" 2>/dev/null || true
+      kill_postgres_hard
+      force_unmount
+      for _ in $(seq 1 100); do
+        kill -0 "$burst_pid" 2>/dev/null || break
+        sleep 0.1
+      done
+      if kill -0 "$burst_pid" 2>/dev/null; then
+        log "dd burst pid $burst_pid stuck on dead device; continuing without it"
+      else
+        wait "$burst_pid" 2>/dev/null || true
+      fi
+      burst_pid=
+      satchel_cmd "$SATCHEL_BIN" vol lease break --yes "$volume" >>"$cycle_dir/lease-break.log" 2>&1 || \
+        fail "lease break failed, see $cycle_dir/lease-break.log"
+      start_satchel "$cycle_dir/takeover-state" "$cycle_dir/satchel-takeover.log" || \
+        fail "takeover mount failed, see $cycle_dir/satchel-takeover.log"
+      pgdata="$mountpoint/pgdata"
+      if [[ -e "$mountpoint/upload-burst.bin" ]]; then
+        log "burst file survived with $(stat -c %s "$mountpoint/upload-burst.bin") bytes (unacked tail loss is acceptable)"
+        rm -f "$mountpoint/upload-burst.bin"
+      else
+        log "burst file lost entirely (acceptable, it was never acked)"
+      fi
+      start_postgres
+      verify_recovery "$cycle_dir" "$base_seq"
+      stop_postgres_clean
+      stop_satchel_clean
+      ;;
+    gc-kill)
+      stop_load
+      stop_postgres_clean
+      stop_satchel_clean
+      log "starting gc in background with grace $SATCHEL_FAULT_GC_GRACE"
+      env \
+        SATCHEL_S3_ENDPOINT="$SATCHEL_S3_ENDPOINT" \
+        SATCHEL_S3_BUCKET="$SATCHEL_S3_BUCKET" \
+        SATCHEL_S3_ACCESS_KEY="$SATCHEL_S3_ACCESS_KEY" \
+        SATCHEL_S3_SECRET_KEY="$SATCHEL_S3_SECRET_KEY" \
+        "$SATCHEL_BIN" vol gc --gc-grace "$SATCHEL_FAULT_GC_GRACE" "$volume" \
+        >"$cycle_dir/gc.log" 2>&1 &
+      gc_pid=$!
+      gc_delay=$((RANDOM % 26 + 5))
+      sleep "$((gc_delay / 10)).$((gc_delay % 10))"
+      if kill -0 "$gc_pid" 2>/dev/null; then
+        log "kill -9 gc pid $gc_pid mid-run after ${gc_delay}00ms"
+        kill -9 "$gc_pid" 2>/dev/null || true
+      else
+        log "gc finished before the kill landed; cycle still valid"
+      fi
+      wait "$gc_pid" 2>/dev/null || true
+      gc_pid=
+      satchel_cmd "$SATCHEL_BIN" vol lease break --yes "$volume" >>"$cycle_dir/lease-break.log" 2>&1 || \
+        fail "lease break failed, see $cycle_dir/lease-break.log"
+      start_satchel "$cycle_dir/takeover-state" "$cycle_dir/satchel-takeover.log" || \
+        fail "post-gc-kill mount failed, see $cycle_dir/satchel-takeover.log"
+      pgdata="$mountpoint/pgdata"
+      start_postgres
+      verify_recovery "$cycle_dir" "$base_seq"
+      stop_postgres_clean
+      stop_satchel_clean
+      log "running gc to completion"
+      satchel_cmd "$SATCHEL_BIN" vol gc --gc-grace "$SATCHEL_FAULT_GC_GRACE" "$volume" \
+        >>"$cycle_dir/gc-final.log" 2>&1 || fail "post-kill gc failed, see $cycle_dir/gc-final.log"
       ;;
     *)
       fail "unknown fault: $fault"

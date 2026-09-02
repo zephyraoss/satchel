@@ -65,10 +65,9 @@ durability.
 
 What remains: S3 availability is still coupled to database availability past the
 lease TTL, which is inherent to single-writer fencing. Operators raise
-`SATCHEL_LEASE_TTL` to widen the tolerance, trading failover speed. One residual
-edge case is documented under Track D — a state-update PUT that commits but loses
-its ack can false-fence on retry, because the manifest timestamp differs across
-attempts.
+`SATCHEL_LEASE_TTL` to widen the tolerance, trading failover speed. The residual
+lost-ack edge case (a state PUT that commits but loses its acknowledgement) is
+also fixed — see Track D.
 
 ## Track A — Destructive fault injection
 
@@ -93,13 +92,43 @@ Exit criteria:
 
 - A multi-day continuous campaign (thousands of cycles) with zero acked-commit
   loss and zero consistency violations.
-- Fault points extended to the dangerous seams: `kill -9` during a checkpoint,
-  during GC, mid-upload of a large generation, and during the state-update PUT
-  itself; partial/torn S3 writes (proxy that drops the connection mid-body);
-  clock skew across takeover; and a real host reboot (`echo b >
-  /proc/sysrq-trigger`) rather than a process kill.
-- Two-node concurrent contention: a second node attempts takeover while the
-  first is still writing, and the fence provably prevents both from publishing.
+- Fault points extended to the dangerous seams. Done and in the default
+  rotation: `satchel-checkpoint` (kill -9 with checkpoint interval 1 so a
+  checkpoint publish is almost certainly torn), `satchel-upload` (kill -9 during
+  a direct-I/O random-data burst so large segment uploads are in flight), and
+  `gc-kill` (kill -9 the collector mid-delete with zero grace, then prove the
+  volume mounts, verifies, and a rerun collects to completion). The lost-ack
+  path (a state PUT that commits but drops its acknowledgement) is covered at
+  the unit level by the Track D fix. Still to add: partial/torn S3 writes via a
+  proxy that drops the connection mid-body, clock skew across takeover, and a
+  real host reboot (`echo b > /proc/sysrq-trigger`) rather than a process kill.
+- The `gc-kill` seam found its first real bug. An interrupted sweep deletes
+  point-in-time manifests in unordered fashion, and the history walk only
+  tolerated a missing manifest directly under a checkpoint (the invariant a
+  completed sweep maintains) — so a killed GC could leave a gap behind
+  surviving expired deltas that wedged every future GC with "read manifest ...
+  object not found". Data was never at risk: restore uses only the chain from
+  the head to the newest checkpoint, and mount/verify passed throughout. Fixed
+  by making the tolerance sticky in `loadHistory` (`internal/replica/remote.go`):
+  once the walk has passed any checkpoint, a missing manifest ends the history
+  instead of failing, and the next sweep reclaims the orphans. A missing
+  manifest above the newest checkpoint — real restorable-chain corruption —
+  still fails the walk. Covered by
+  `TestHistoryToleratesManifestsRemovedByInterruptedGC` (fails against the
+  pre-fix code) and `TestHistoryFailsOnMissingManifestAboveNewestCheckpoint`;
+  the wedged bench volume was recovered in place by the fixed binary (127
+  orphans marked, then deleted on the following pass).
+- Two-node concurrent contention — both takeover paths now have integration
+  tests in `test/e2e` with real NBD mounts and live heartbeats. The operator
+  path (`TestConcurrentWriterIsFencedAfterTakeover`): node A publishes, an
+  operator breaks its lease, node B takes over and restores A's data, and A's
+  next durable write fences its mount. The automatic path
+  (`TestPartitionedWriterSelfFencesAndYields`): node A is partitioned from S3,
+  its in-flight commit stalls, it self-fences when the lease TTL expires, the
+  stalled fsync returns `EIO` instead of a false ack, and node B takes over
+  after expiry. In both, the durable state afterward contains only the
+  legitimate writes and the superseded node's post-partition write is absent.
+  Still to add: a concurrent (not operator- or partition-driven) mount race.
 - Every failure preserved with its goroutine dump, satchel log, and postgres
   log for triage.
 
@@ -154,13 +183,19 @@ Testing is already pointing at code changes, not just documentation.
   (`SATCHEL_LEASE_TTL`) is the hard backstop and is already configurable. The
   split-brain guarantee is intact: publication only acknowledges through the
   conditional state update, and a real takeover still fences immediately.
-- **Residual: lost-ack idempotency on the state PUT.** A state update that
-  commits but whose acknowledgement is lost will false-fence on retry, because
-  the retried manifest carries a fresh `CreatedAt` timestamp and no longer
-  matches the committed body. "Connection refused" outages don't trigger it, but
-  a mid-response network partition can. Fix by making the manifest timestamp
-  stable across retries of the same pending generation set, so `commitState`'s
-  body comparison recovers a lost ack.
+- **Lost-ack idempotency on the state PUT — done.** A state update that commits
+  but loses its acknowledgement (connection dies mid-response) used to
+  false-fence on retry, because the rebuilt body carried a fresh manifest
+  timestamp and renewed lease expiry and no longer matched the committed bytes.
+  The lease now remembers the exact marshaled body of an ambiguously-failed
+  commit; every later commit attempt first fetches `state.json`, and if the
+  current bytes equal the remembered attempt, adopts it as committed instead of
+  rebuilding (`internal/replica/remote.go`). This covers publish, checkpoint,
+  renew, and release. A genuine takeover still surfaces `ErrLeaseLost`
+  unchanged, covered by `TestPublishRetryAdoptsCommitAfterLostAck`,
+  `TestPublishRetryAfterLostAckDetectsTakeover`, and
+  `TestRemoteFlushRecoversFromLostPublishAck`, all of which fail against the
+  pre-fix code.
 - **Performance across real storage.** The current numbers come from one slow
   SSD-class virtual disk (native one-client 55 TPS). Characterize the local
   block path on genuine NVMe to separate Satchel overhead from disk, and confirm

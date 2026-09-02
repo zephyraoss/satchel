@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
 	"regexp"
 	"sort"
 	"strings"
@@ -314,9 +315,18 @@ type Lease struct {
 	plan      []ObjectRef
 	planKnown bool
 
+	pending         *pendingCommit
+	adoptedManifest *Manifest
+
 	bundleInFlight string
 	bundleDone     chan struct{}
 	readyBundle    *preparedManifestBundle
+}
+
+type pendingCommit struct {
+	body     []byte
+	manifest *Manifest
+	commit   func(etag string)
 }
 
 func (l *Lease) Heartbeat(ctx context.Context, onLost func(error)) {
@@ -366,6 +376,12 @@ func (l *Lease) update(ctx context.Context, mutate func(*State) error) error {
 	if l.lost || l.state.Lease == nil {
 		return ErrLeaseLost
 	}
+	if err := l.resolvePendingLocked(ctx); err != nil {
+		return err
+	}
+	if l.state.Lease == nil {
+		return ErrLeaseLost
+	}
 	candidate := cloneState(l.state)
 	bundle := l.readyManifestBundleLocked()
 	if bundle != nil {
@@ -384,15 +400,63 @@ func (l *Lease) update(ctx context.Context, mutate func(*State) error) error {
 		return ErrLeaseLost
 	}
 	if err != nil {
+		l.pending = &pendingCommit{body: body, commit: func(etag string) {
+			l.applyCommitLocked(candidate, etag, bundle)
+		}}
 		return err
 	}
+	l.applyCommitLocked(candidate, etag, bundle)
+	return nil
+}
+
+func (l *Lease) resolvePendingLocked(ctx context.Context) error {
+	pending := l.pending
+	if pending == nil {
+		return nil
+	}
+	current, err := l.remote.Store.Get(ctx, StateKey(l.state.Name))
+	if err != nil {
+		return err
+	}
+	l.pending = nil
+	if bytes.Equal(current.Data, pending.body) {
+		pending.commit(current.ETag)
+		if pending.manifest != nil {
+			l.adoptedManifest = pending.manifest
+		}
+	}
+	return nil
+}
+
+func (l *Lease) applyCommitLocked(candidate State, etag string, bundle *preparedManifestBundle) {
 	l.state = candidate
 	l.etag = etag
 	if bundle != nil {
 		l.plan = attachBundleToRefs(l.plan, bundle)
-		l.readyBundle = nil
+		if l.readyBundle != nil && l.readyBundle.ref.Key == bundle.ref.Key {
+			l.readyBundle = nil
+		}
 	}
-	return nil
+}
+
+func (l *Lease) applyManifestCommitLocked(candidate State, etag string, prepared preparedManifest, bundle *preparedManifestBundle) {
+	l.applyCommitLocked(candidate, etag, bundle)
+	l.adoptedManifest = nil
+	switch prepared.manifest.Kind {
+	case "delta":
+		if l.planKnown {
+			l.plan = applyDeltaToPlan(l.plan, checkpointRefs(prepared))
+		}
+	case "checkpoint":
+		l.plan = cloneObjectRefs(prepared.manifest.Segments)
+		l.planKnown = true
+	}
+}
+
+func sameLogicalManifest(a, b Manifest) bool {
+	a.CreatedAt = time.Time{}
+	b.CreatedAt = time.Time{}
+	return reflect.DeepEqual(a, b)
 }
 
 func (l *Lease) commitState(ctx context.Context, body []byte) (string, error) {
@@ -427,6 +491,10 @@ func (l *Lease) Publish(ctx context.Context, segments ...Segment) error {
 	if l.lost || l.state.Lease == nil {
 		l.mu.Unlock()
 		return ErrLeaseLost
+	}
+	if l.consumeAdoptedPublishLocked(segments) {
+		l.mu.Unlock()
+		return nil
 	}
 	snapshot := cloneState(l.state)
 	l.mu.Unlock()
@@ -466,6 +534,22 @@ func (l *Lease) Publish(ctx context.Context, segments ...Segment) error {
 		return err
 	}
 	return l.publishPrepared(ctx, snapshot, prepared, segments, nil, false)
+}
+
+func (l *Lease) consumeAdoptedPublishLocked(segments []Segment) bool {
+	adopted := l.adoptedManifest
+	if adopted == nil || adopted.Kind != "delta" ||
+		adopted.Generation != l.state.Generation || adopted.Epoch != l.state.Epoch ||
+		len(adopted.Segments) != len(segments) {
+		return false
+	}
+	for index, segment := range segments {
+		if adopted.Segments[index].SHA256 != segment.SHA256 {
+			return false
+		}
+	}
+	l.adoptedManifest = nil
+	return true
 }
 
 func (l *Lease) uploadSegments(ctx context.Context, snapshot State, segments []Segment) ([]ObjectRef, error) {
@@ -907,6 +991,16 @@ func (l *Lease) commitManifest(
 	if l.lost || l.state.Lease == nil {
 		return ErrLeaseLost
 	}
+	if err := l.resolvePendingLocked(ctx); err != nil {
+		return err
+	}
+	if adopted := l.adoptedManifest; adopted != nil && sameLogicalManifest(*adopted, prepared.manifest) {
+		l.adoptedManifest = nil
+		return nil
+	}
+	if l.state.Lease == nil {
+		return ErrLeaseLost
+	}
 	if l.state.Generation != snapshot.Generation || l.state.Manifest != snapshot.Manifest || l.state.Epoch != snapshot.Epoch {
 		return errors.New("volume head changed during publish")
 	}
@@ -943,25 +1037,13 @@ func (l *Lease) commitManifest(
 		return ErrLeaseLost
 	}
 	if err != nil {
+		manifest := prepared.manifest
+		l.pending = &pendingCommit{body: stateBody, manifest: &manifest, commit: func(etag string) {
+			l.applyManifestCommitLocked(candidate, etag, prepared, bundle)
+		}}
 		return fmt.Errorf("publish volume head: %w", err)
 	}
-	l.state = candidate
-	l.etag = etag
-	if bundle != nil {
-		l.plan = attachBundleToRefs(l.plan, bundle)
-		if l.readyBundle != nil && l.readyBundle.ref.Key == bundle.ref.Key {
-			l.readyBundle = nil
-		}
-	}
-	switch prepared.manifest.Kind {
-	case "delta":
-		if l.planKnown {
-			l.plan = applyDeltaToPlan(l.plan, checkpointRefs(prepared))
-		}
-	case "checkpoint":
-		l.plan = cloneObjectRefs(prepared.manifest.Segments)
-		l.planKnown = true
-	}
+	l.applyManifestCommitLocked(candidate, etag, prepared, bundle)
 	return nil
 }
 
@@ -1151,10 +1233,13 @@ func (r *Remote) loadHistory(ctx context.Context, state State) ([]manifestEntry,
 	bundles := make(map[string]manifestBundle)
 	key := state.Manifest
 	expectedGeneration := state.Generation
-	allowMissingParent := false
+	behindCheckpoint := false
 	for key != "" {
 		manifest, bundle, err := r.readManifestWithSourceCache(ctx, state, key, expectedGeneration, bundles)
-		if errors.Is(err, objectstore.ErrNotFound) && allowMissingParent {
+		// History behind the newest traversed checkpoint is point-in-time
+		// metadata only; a missing object there means garbage collection
+		// truncated it (possibly mid-sweep), not that restorable data is gone.
+		if errors.Is(err, objectstore.ErrNotFound) && behindCheckpoint {
 			break
 		}
 		if err != nil {
@@ -1167,10 +1252,12 @@ func (r *Remote) loadHistory(ctx context.Context, state State) ([]manifestEntry,
 			}
 			break
 		}
-		allowMissingParent = manifest.Kind == "checkpoint"
+		if manifest.Kind == "checkpoint" {
+			behindCheckpoint = true
+		}
 		key = manifest.Parent
 		expectedGeneration--
-		if key == "" && !allowMissingParent {
+		if key == "" && manifest.Kind != "checkpoint" {
 			return nil, errors.New("manifest history ended before generation one")
 		}
 		if len(history) > 1_000_000 {
