@@ -511,6 +511,8 @@ func (d *Device) Close() error {
 		return nil
 	}
 	d.closed = true
+	d.dirty = 0
+	d.observeDirtyLocked()
 	d.ready.Broadcast()
 	err := d.file.Close()
 	if d.hydrator != nil {

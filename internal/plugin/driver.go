@@ -528,6 +528,7 @@ func (d *Driver) fence(state *volumeState, mount *mountState, cause error) {
 	mount.active, mount.lease, mount.device, mount.unmounter, mount.syncer, mount.stopBeat = false, nil, nil, nil, nil, nil
 	mount.fenced = cause
 	metrics.MountedVolumes.Dec()
+	metrics.UnpublishedBytes.DeleteLabelValues(mount.name)
 }
 
 func (d *Driver) Unmount(req *volume.UnmountRequest) error {
@@ -597,6 +598,7 @@ func (d *Driver) abandonUnmounted(mount *mountState, cause error) error {
 		_ = mount.device.Close()
 	}
 	metrics.MountedVolumes.Dec()
+	metrics.UnpublishedBytes.DeleteLabelValues(mount.name)
 	d.cleanupLocal(mount.name)
 	mount.active, mount.lease, mount.device, mount.unmounter, mount.syncer, mount.stopBeat = false, nil, nil, nil, nil, nil
 	return cause
