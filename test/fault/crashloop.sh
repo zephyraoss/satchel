@@ -17,7 +17,21 @@ CYCLES=${1:-8}
 : "${SATCHEL_FAULT_LOAD_MAX_SECONDS:=25}"
 : "${SATCHEL_FAULT_FAULTS:=pg satchel-break satchel-ttl s3-outage satchel-checkpoint satchel-upload gc-kill s3-chaos}"
 : "${SATCHEL_LEASE_TTL:=30s}"
-: "${SATCHEL_FAULT_S3_OUTAGE_SECONDS:=$(( ${SATCHEL_LEASE_TTL%s} * 2 ))}"
+
+duration_seconds() {
+  case "$1" in
+    *h) echo $(( ${1%h} * 3600 )) ;;
+    *m) echo $(( ${1%m} * 60 )) ;;
+    *s) echo "${1%s}" ;;
+    *) echo "$1" ;;
+  esac
+}
+lease_ttl_seconds=$(duration_seconds "$SATCHEL_LEASE_TTL")
+if ! [[ "$lease_ttl_seconds" =~ ^[0-9]+$ ]]; then
+  echo "SATCHEL_LEASE_TTL must be an integer number of seconds, minutes, or hours (got $SATCHEL_LEASE_TTL)" >&2
+  exit 2
+fi
+: "${SATCHEL_FAULT_S3_OUTAGE_SECONDS:=$(( lease_ttl_seconds * 2 ))}"
 : "${SATCHEL_FAULT_S3_STOP:=systemctl stop minio}"
 : "${SATCHEL_FAULT_S3_START:=systemctl start minio}"
 : "${SATCHEL_FAULT_LEASE_TTL_WAIT:=40}"
@@ -399,7 +413,7 @@ for ((cycle = 1; cycle <= CYCLES; cycle++)); do
       sleep "$SATCHEL_FAULT_S3_OUTAGE_SECONDS"
       $SATCHEL_FAULT_S3_START
       sleep 15
-      if (( SATCHEL_FAULT_S3_OUTAGE_SECONDS > ${SATCHEL_LEASE_TTL%s} )); then
+      if (( SATCHEL_FAULT_S3_OUTAGE_SECONDS > lease_ttl_seconds )); then
         if ! grep -q "fencing volume" "$cycle_dir/satchel.log"; then
           fail "outage exceeded the lease TTL but the writer did not fence, see $cycle_dir/satchel.log"
         fi
