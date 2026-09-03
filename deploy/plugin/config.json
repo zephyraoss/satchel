@@ -29,7 +29,8 @@
     ]
   },
   "mounts": [
-    { "source": "/var/lib/satchel", "destination": "/var/lib/satchel", "type": "bind", "options": ["rbind"] }
+    { "source": "/var/lib/satchel/volumes", "destination": "/var/lib/satchel/volumes", "type": "bind", "options": ["rbind"] },
+    { "source": "/var/lib/satchel/images", "destination": "/var/lib/satchel/images", "type": "bind", "options": ["rbind"] }
   ],
   "propagatedmount": "/var/lib/satchel/mounts",
   "env": [

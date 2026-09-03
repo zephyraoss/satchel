@@ -1,0 +1,87 @@
+version: "3"
+
+vars:
+  REGISTRY: ghcr.io
+  REPO:
+    sh: gh repo view --json nameWithOwner -q .nameWithOwner
+  IMAGE: "{{.REGISTRY}}/{{.REPO}}"
+  VERSION:
+    sh: git describe --tags --always --dirty
+  TAG: '{{default .VERSION .TAG}}'
+  DOCKER: '{{default "docker" .DOCKER}}'
+  GHCR_SCOPE: write:packages
+
+tasks:
+  default:
+    cmds:
+      - task --list
+
+  build:
+    desc: Build the satchel binary into dist/
+    cmds:
+      - CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o dist/satchel ./cmd/satchel
+
+  test:
+    desc: Run the hermetic test suite
+    cmds:
+      - go test ./...
+
+  version:
+    desc: Print the image reference that publish would produce
+    silent: true
+    cmds:
+      - echo "{{.IMAGE}}:{{.TAG}}"
+
+  ghcr:scope:
+    desc: Ensure the gh token can write packages, refreshing it if needed
+    silent: true
+    cmds:
+      - |
+        if gh auth status 2>/dev/null | grep -q "{{.GHCR_SCOPE}}"; then
+          echo "gh token already has {{.GHCR_SCOPE}}"
+        else
+          echo "gh token is missing {{.GHCR_SCOPE}}; refreshing"
+          gh auth refresh --hostname github.com --scopes {{.GHCR_SCOPE}}
+        fi
+
+  ghcr:login:
+    desc: Log the container CLI into GHCR with the gh token
+    deps: [ghcr:scope]
+    cmds:
+      - gh auth token | {{.DOCKER}} login {{.REGISTRY}} -u "$(gh api user -q .login)" --password-stdin
+
+  image:build:
+    desc: Build the plugin rootfs image (TAG overrides the git version)
+    cmds:
+      - "{{.DOCKER}} build -f deploy/plugin/Dockerfile -t {{.IMAGE}}:{{.TAG}} ."
+
+  image:push:
+    desc: Push the plugin rootfs image to GHCR
+    deps: [ghcr:login]
+    cmds:
+      - "{{.DOCKER}} push {{.IMAGE}}:{{.TAG}}"
+
+  plugin:build:
+    desc: Create the managed Docker plugin locally (TAG overrides the git version)
+    cmds:
+      - PLUGIN={{.IMAGE}} TAG={{.TAG}} ./deploy/plugin/build.sh
+
+  plugin:push:
+    desc: Push the managed Docker plugin to GHCR
+    deps: [ghcr:login]
+    cmds:
+      - docker plugin push {{.IMAGE}}:{{.TAG}}
+
+  publish:
+    desc: Build and push the managed plugin to GHCR (TAG=latest to publish a moving tag)
+    cmds:
+      - task: plugin:build
+      - task: plugin:push
+      - echo "published {{.IMAGE}}:{{.TAG}}"
+
+  publish:release:
+    desc: Publish the plugin under both the git version and latest
+    cmds:
+      - task: publish
+      - task: publish
+        vars: { TAG: latest }
