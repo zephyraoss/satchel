@@ -111,13 +111,10 @@ func (s *Syncer) process(ctx context.Context, pending *[]*Generation, first sync
 		}
 		return false
 	}
-	for len(requests) < 128 {
-		if !drain() {
-			goto drained
-		}
+	for len(requests) < 128 && drain() {
 	}
+	s.rearmWakeIfQueued()
 
-drained:
 	checkpoint := false
 	for _, request := range requests {
 		if !request.generation.Empty() {
@@ -249,6 +246,19 @@ func (s *Syncer) enqueue(request syncRequest) {
 	}
 	s.requests = append(s.requests, request)
 	s.queueMu.Unlock()
+	select {
+	case s.wake <- struct{}{}:
+	default:
+	}
+}
+
+func (s *Syncer) rearmWakeIfQueued() {
+	s.queueMu.Lock()
+	queued := len(s.requests) > 0
+	s.queueMu.Unlock()
+	if !queued {
+		return
+	}
 	select {
 	case s.wake <- struct{}{}:
 	default:
