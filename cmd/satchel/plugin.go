@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
@@ -22,6 +21,7 @@ import (
 	"github.com/zephyraoss/satchel/internal/plugin"
 	"github.com/zephyraoss/satchel/internal/replica"
 	"github.com/zephyraoss/satchel/internal/seed"
+	"github.com/zephyraoss/satchel/internal/units"
 )
 
 type pluginOptions struct {
@@ -148,7 +148,7 @@ func buildDriver(ctx context.Context, opts pluginOptions) (*plugin.Driver, *slog
 	}
 	logger.Info("S3 backend verified", "endpoint", opts.s3.Endpoint, "bucket", opts.s3.Bucket, "head", headMode)
 
-	dirtyLimit, err := parseBytes(opts.dirtyLimit)
+	dirtyLimit, err := units.ParseBytes(opts.dirtyLimit)
 	if err != nil {
 		return nil, nil, fmt.Errorf("--dirty-limit: %w", err)
 	}
@@ -212,22 +212,4 @@ func startMetricsServer(addr string, logger *slog.Logger) {
 			logger.Error("metrics server stopped", "err", err)
 		}
 	}()
-}
-
-func parseBytes(s string) (int64, error) {
-	s = strings.TrimSpace(s)
-	units := []struct {
-		suffix string
-		mult   int64
-	}{{"GiB", 1 << 30}, {"MiB", 1 << 20}, {"KiB", 1 << 10}, {"G", 1 << 30}, {"M", 1 << 20}, {"K", 1 << 10}, {"B", 1}}
-	for _, u := range units {
-		if strings.HasSuffix(s, u.suffix) {
-			n, err := strconv.ParseInt(strings.TrimSuffix(s, u.suffix), 10, 64)
-			if err != nil {
-				return 0, err
-			}
-			return n * u.mult, nil
-		}
-	}
-	return strconv.ParseInt(s, 10, 64)
 }

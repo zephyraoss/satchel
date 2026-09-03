@@ -2,8 +2,7 @@ package plugin
 
 import (
 	"fmt"
-	"strconv"
-	"strings"
+	"github.com/zephyraoss/satchel/internal/units"
 	"time"
 )
 
@@ -53,7 +52,7 @@ func ParseVolumeOptions(raw map[string]string) (VolumeOptions, error) {
 			}
 			opts.SyncInterval = d
 		case "size":
-			size, err := parseSize(value)
+			size, err := units.ParseBytes(value)
 			if err != nil || size < 64<<20 || size%4096 != 0 {
 				return opts, fmt.Errorf("size must be at least 64MiB and aligned to 4KiB, got %q", value)
 			}
@@ -71,25 +70,4 @@ func ParseVolumeOptions(raw map[string]string) (VolumeOptions, error) {
 		return opts, fmt.Errorf("seed cannot be combined with mode=ro")
 	}
 	return opts, nil
-}
-
-func parseSize(value string) (int64, error) {
-	value = strings.TrimSpace(value)
-	units := []struct {
-		suffix string
-		factor int64
-	}{
-		{"GiB", 1 << 30}, {"MiB", 1 << 20}, {"KiB", 1 << 10},
-		{"G", 1 << 30}, {"M", 1 << 20}, {"K", 1 << 10}, {"B", 1},
-	}
-	for _, unit := range units {
-		if strings.HasSuffix(value, unit.suffix) {
-			n, err := strconv.ParseInt(strings.TrimSpace(strings.TrimSuffix(value, unit.suffix)), 10, 64)
-			if err != nil || n <= 0 || n > (1<<63-1)/unit.factor {
-				return 0, fmt.Errorf("invalid size %q", value)
-			}
-			return n * unit.factor, nil
-		}
-	}
-	return strconv.ParseInt(value, 10, 64)
 }
