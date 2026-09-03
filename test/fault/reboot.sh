@@ -61,8 +61,8 @@ start_satchel() {
   satchel_pid=$!
   mountpoint=
   for _ in $(seq 1 $((SATCHEL_FAULT_MOUNT_TIMEOUT * 10))); do
-    mountpoint=$(head -1 "$log_file" 2>/dev/null || true)
-    if [[ -d "$mountpoint" ]]; then
+    mountpoint="$state_dir/mounts/$volume"
+    if mountpoint -q "$mountpoint" 2>/dev/null; then
       chmod 0711 "$state_dir" "$state_dir/mounts"
       return 0
     fi
@@ -156,6 +156,11 @@ if [[ "$PHASE" == crash ]]; then
 fi
 
 [[ -d "$run_root" ]] || fail "run $RUN has no crash-phase artifacts under $run_root"
+cleanup_verify() {
+  stop_postgres_clean
+  stop_satchel_clean
+}
+trap cleanup_verify EXIT
 log "verifying after hard reboot"
 rm -rf "$run_root/state"
 env \

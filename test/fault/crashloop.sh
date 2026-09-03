@@ -16,7 +16,8 @@ CYCLES=${1:-8}
 : "${SATCHEL_FAULT_LOAD_MIN_SECONDS:=8}"
 : "${SATCHEL_FAULT_LOAD_MAX_SECONDS:=25}"
 : "${SATCHEL_FAULT_FAULTS:=pg satchel-break satchel-ttl s3-outage satchel-checkpoint satchel-upload gc-kill s3-chaos}"
-: "${SATCHEL_FAULT_S3_OUTAGE_SECONDS:=30}"
+: "${SATCHEL_LEASE_TTL:=30s}"
+: "${SATCHEL_FAULT_S3_OUTAGE_SECONDS:=$(( ${SATCHEL_LEASE_TTL%s} * 2 ))}"
 : "${SATCHEL_FAULT_S3_STOP:=systemctl stop minio}"
 : "${SATCHEL_FAULT_S3_START:=systemctl start minio}"
 : "${SATCHEL_FAULT_LEASE_TTL_WAIT:=40}"
@@ -103,6 +104,7 @@ start_satchel() {
     SATCHEL_SYNC_INTERVAL="$SATCHEL_SYNC_INTERVAL" \
     SATCHEL_DIRTY_LIMIT="$SATCHEL_DIRTY_LIMIT" \
     SATCHEL_CHECKPOINT_INTERVAL="$checkpoint_interval" \
+    SATCHEL_LEASE_TTL="$SATCHEL_LEASE_TTL" \
     "$SATCHEL_BIN" mount "$volume" \
       --size "$SATCHEL_FAULT_VOLUME_SIZE" \
       --durability remote \
@@ -110,8 +112,8 @@ start_satchel() {
   satchel_pid=$!
   mountpoint=
   for _ in $(seq 1 $((SATCHEL_FAULT_MOUNT_TIMEOUT * 10))); do
-    mountpoint=$(head -1 "$log_file" 2>/dev/null || true)
-    if [[ -d "$mountpoint" ]]; then
+    mountpoint="$state_dir/mounts/$volume"
+    if mountpoint -q "$mountpoint" 2>/dev/null; then
       chmod 0711 "$state_dir" "$state_dir/mounts"
       return 0
     fi
@@ -286,6 +288,10 @@ start_chaos_proxy() {
   if [[ ! -x "$SATCHEL_FAULT_CHAOSPROXY_BIN" ]]; then
     go build -o "$SATCHEL_FAULT_CHAOSPROXY_BIN" ./test/fault/chaosproxy || fail "chaosproxy build failed"
   fi
+  case "$SATCHEL_S3_ENDPOINT" in
+    http://*) ;;
+    *) fail "s3-chaos needs a plain http:// S3 endpoint; the chaos proxy forwards raw TCP and cannot terminate TLS (got $SATCHEL_S3_ENDPOINT)" ;;
+  esac
   "$SATCHEL_FAULT_CHAOSPROXY_BIN" \
     -listen "$SATCHEL_FAULT_CHAOS_ADDR" \
     -target "${SATCHEL_S3_ENDPOINT#http://}" \
@@ -388,15 +394,20 @@ for ((cycle = 1; cycle <= CYCLES; cycle++)); do
       stop_satchel_clean
       ;;
     s3-outage)
-      log "stopping S3 for ${SATCHEL_FAULT_S3_OUTAGE_SECONDS}s (under lease TTL stalls commits; over it self-fences)"
+      log "stopping S3 for ${SATCHEL_FAULT_S3_OUTAGE_SECONDS}s against lease TTL $SATCHEL_LEASE_TTL"
       $SATCHEL_FAULT_S3_STOP
       sleep "$SATCHEL_FAULT_S3_OUTAGE_SECONDS"
       $SATCHEL_FAULT_S3_START
       sleep 15
-      if kill -0 "$satchel_pid" 2>/dev/null && kill -0 "$pg_pid" 2>/dev/null; then
-        log "survived outage without fencing (outage shorter than renewal window)"
-      else
+      if (( SATCHEL_FAULT_S3_OUTAGE_SECONDS > ${SATCHEL_LEASE_TTL%s} )); then
+        if ! grep -q "fencing volume" "$cycle_dir/satchel.log"; then
+          fail "outage exceeded the lease TTL but the writer did not fence, see $cycle_dir/satchel.log"
+        fi
         log "writer fenced during outage as designed; verifying recovery after S3 return"
+      elif kill -0 "$satchel_pid" 2>/dev/null && kill -0 "$pg_pid" 2>/dev/null; then
+        log "survived outage without fencing (outage shorter than the lease TTL)"
+      else
+        fail "outage was shorter than the lease TTL but the writer or database died, see $cycle_dir/satchel.log"
       fi
       stop_load
       kill_postgres_hard
@@ -513,10 +524,16 @@ for ((cycle = 1; cycle <= CYCLES; cycle++)); do
       if kill -0 "$gc_pid" 2>/dev/null; then
         log "kill -9 gc pid $gc_pid mid-run after ${gc_delay}00ms"
         kill -9 "$gc_pid" 2>/dev/null || true
+        wait "$gc_pid" 2>/dev/null || true
       else
-        log "gc finished before the kill landed; cycle still valid"
+        gc_status=0
+        wait "$gc_pid" 2>/dev/null || gc_status=$?
+        if (( gc_status != 0 )); then
+          fail "gc exited with status $gc_status before the kill landed, see $cycle_dir/gc.log"
+        fi
+        log "gc finished before the kill landed; interrupted-sweep fault NOT exercised this cycle"
+        echo "$cycle" >>"$run_root/gc-kill-untested.log"
       fi
-      wait "$gc_pid" 2>/dev/null || true
       gc_pid=
       satchel_cmd "$SATCHEL_BIN" vol lease break --yes "$volume" >>"$cycle_dir/lease-break.log" 2>&1 || \
         fail "lease break failed, see $cycle_dir/lease-break.log"
@@ -549,4 +566,7 @@ for ((cycle = 1; cycle <= CYCLES; cycle++)); do
   log "cycle $cycle ok"
 done
 
+if [[ -s "$run_root/gc-kill-untested.log" ]]; then
+  log "warning: gc-kill cycles $(paste -sd, "$run_root/gc-kill-untested.log") finished before the kill and did not exercise an interrupted sweep"
+fi
 log "campaign complete: $CYCLES cycles, volume $volume"

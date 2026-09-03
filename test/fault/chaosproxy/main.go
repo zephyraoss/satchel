@@ -1,12 +1,16 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"flag"
 	"io"
 	"log"
 	"math/rand"
 	"net"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -63,8 +67,13 @@ func proxy(client net.Conn, target, chaosFile string) {
 	go pipe(server, client, mode == killRequestMidBody, done)
 	go pipe(client, server, mode == killResponseMidBody, done)
 	<-done
-	abort(client)
-	abort(server)
+	if mode == passthrough {
+		_ = client.Close()
+		_ = server.Close()
+	} else {
+		abort(client)
+		abort(server)
+	}
 	<-done
 	if mode != passthrough {
 		log.Printf("dropped connection mid-body (mode %d)", mode)
@@ -74,11 +83,56 @@ func proxy(client net.Conn, target, chaosFile string) {
 func pipe(dst, src net.Conn, sabotage bool, done chan<- struct{}) {
 	if sabotage {
 		limit := int64(512 + rand.Intn(128<<10))
-		_, _ = io.CopyN(dst, src, limit)
+		reader := bufio.NewReader(src)
+		if _, err := io.CopyN(dst, &messageBoundedReader{reader: reader, remaining: limit}, limit); err == nil {
+			log.Printf("forwarded %d bytes before cutting the stream", limit)
+		}
 	} else {
 		_, _ = io.Copy(dst, src)
 	}
 	done <- struct{}{}
+}
+
+type messageBoundedReader struct {
+	reader    *bufio.Reader
+	remaining int64
+	headerEnd bool
+	bodyLeft  int64
+}
+
+func (m *messageBoundedReader) Read(p []byte) (int, error) {
+	if m.remaining <= 0 {
+		return 0, io.EOF
+	}
+	if !m.headerEnd {
+		line, err := m.reader.ReadSlice('\n')
+		if err != nil && len(line) == 0 {
+			return 0, err
+		}
+		n := copy(p, line)
+		m.remaining -= int64(n)
+		if bytes.HasPrefix(bytes.ToLower(line), []byte("content-length:")) {
+			m.bodyLeft, _ = strconv.ParseInt(strings.TrimSpace(string(line[len("content-length:"):])), 10, 64)
+		}
+		if bytes.Equal(line, []byte("\r\n")) || bytes.Equal(line, []byte("\n")) {
+			m.headerEnd = true
+		}
+		return n, nil
+	}
+	if m.bodyLeft <= 0 {
+		return 0, io.EOF
+	}
+	limit := int64(len(p))
+	if m.bodyLeft < limit {
+		limit = m.bodyLeft
+	}
+	if m.remaining < limit {
+		limit = m.remaining
+	}
+	n, err := m.reader.Read(p[:limit])
+	m.bodyLeft -= int64(n)
+	m.remaining -= int64(n)
+	return n, err
 }
 
 func abort(conn net.Conn) {
