@@ -41,7 +41,10 @@ type Extent struct {
 
 func (e Extent) end() uint64 { return e.Start + e.Blocks }
 
-const DefaultSegmentBlocks = 1024
+const (
+	DefaultSegmentBlocks = 1024
+	maxRunBlocks         = 256
+)
 
 func EncodeSegments(g *Generation, blocksPerSegment int) ([]Segment, error) {
 	if g.Empty() {
@@ -51,7 +54,7 @@ func EncodeSegments(g *Generation, blocksPerSegment int) ([]Segment, error) {
 		blocksPerSegment = DefaultSegmentBlocks
 	}
 	blocks := sortedBlocks(g)
-	count := (len(blocks) + blocksPerSegment - 1) / blocksPerSegment
+	count := (len(blocks)-1)/blocksPerSegment + 1
 	if count == 1 {
 		segment, err := EncodeSegment(g)
 		if err != nil {
@@ -105,7 +108,7 @@ func encodeSegmentBlocks(g *Generation, blocks []uint64) (Segment, error) {
 		if len(g.Blocks[block]) != DefaultBlockSize {
 			return Segment{}, fmt.Errorf("block %d has length %d, want %d", block, len(g.Blocks[block]), DefaultBlockSize)
 		}
-		if len(runs) == 0 || block != runs[len(runs)-1][len(runs[len(runs)-1])-1]+1 || len(runs[len(runs)-1]) >= 256 {
+		if len(runs) == 0 || block != runs[len(runs)-1][len(runs[len(runs)-1])-1]+1 || len(runs[len(runs)-1]) >= maxRunBlocks {
 			runs = append(runs, []uint64{block})
 		} else {
 			runs[len(runs)-1] = append(runs[len(runs)-1], block)
@@ -244,15 +247,15 @@ func decodeSegment(segment Segment) ([]decodedRun, error) {
 		if err := binary.Read(zr, binary.BigEndian, &length); err != nil {
 			return nil, err
 		}
-		if length == 0 || length%blockSize != 0 {
+		if length == 0 || length%blockSize != 0 || length > maxRunBlocks*blockSize {
 			return nil, errors.New("segment contains an invalid extent")
 		}
 		extent := Extent{Start: block, Blocks: uint64(length / blockSize)}
 		if int64(extent.Blocks) > segment.Blocks-blocks {
 			return nil, errors.New("segment block count exceeds its manifest")
 		}
-		if extent.end() < extent.Start || i > 0 && extent.Start < lastEnd {
-			return nil, errors.New("segment contains overlapping extents")
+		if extent.end() < extent.Start || extent.end() > maxImageBlocks || i > 0 && extent.Start < lastEnd {
+			return nil, errors.New("segment contains overlapping or out-of-range extents")
 		}
 		data := make([]byte, length)
 		if _, err := io.ReadFull(zr, data); err != nil {
@@ -292,13 +295,14 @@ func applyRuns(f *os.File, size int64, runs []decodedRun, selected []Extent) err
 			selected[i] = run.extent
 		}
 	}
+	imageBlocks := uint64(size / DefaultBlockSize)
 	for _, run := range runs {
 		for _, overlap := range intersectExtent(run.extent, selected) {
-			offset := int64(overlap.Start) * DefaultBlockSize
-			length := int64(overlap.Blocks) * DefaultBlockSize
-			if offset < 0 || length > size-offset {
+			if overlap.end() < overlap.Start || overlap.end() > imageBlocks {
 				return errors.New("segment contains an extent outside the image")
 			}
+			offset := int64(overlap.Start) * DefaultBlockSize
+			length := int64(overlap.Blocks) * DefaultBlockSize
 			start := int((overlap.Start - run.extent.Start) * DefaultBlockSize)
 			data := run.data[start : start+int(length)]
 			if isZero(data) {
@@ -332,6 +336,8 @@ func intersectExtent(target Extent, extents []Extent) []Extent {
 	}
 	return result
 }
+
+const maxImageBlocks = uint64(1<<63-1) / DefaultBlockSize
 
 func isZero(data []byte) bool {
 	for _, value := range data {
