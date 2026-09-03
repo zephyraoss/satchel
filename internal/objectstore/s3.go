@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
@@ -178,7 +179,11 @@ func (s *S3) DeletePrefix(ctx context.Context, prefix string) error {
 
 func VerifyConditionalWrites(ctx context.Context, store Store) error {
 	probe := "leases/.probe-" + uuid.NewString()
-	defer store.Delete(context.WithoutCancel(ctx), probe)
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
+		_ = store.Delete(cleanupCtx, probe)
+	}()
 
 	etag, err := store.PutIfAbsent(ctx, probe, []byte("probe"))
 	if err != nil {
@@ -199,7 +204,11 @@ func VerifyConditionalWrites(ctx context.Context, store Store) error {
 func VerifyListedWrites(ctx context.Context, store Store) error {
 	prefix := "leases/.probe-" + uuid.NewString()
 	key := prefix + "/head"
-	defer store.Delete(context.WithoutCancel(ctx), key)
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
+		_ = store.Delete(cleanupCtx, key)
+	}()
 
 	if _, err := store.Put(ctx, key, []byte("probe")); err != nil {
 		return fmt.Errorf("probe write: %w", err)
