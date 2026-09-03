@@ -51,7 +51,7 @@ const (
 	nbdFlagSendTrim       = 1 << 5
 	nbdFlagSendWriteZeros = 1 << 6
 
-	maxNBDRequest = 4 << 20
+	maxNBDRequest = 32 << 20
 )
 
 type Attachment struct {
@@ -368,7 +368,8 @@ func serveNBD(conn net.Conn, device *replica.Device, readOnly bool) error {
 		default:
 			requestErr = unix.EINVAL
 		}
-		if command == nbdCmdWrite && typeAndFlags&nbdCmdFlagFUA != 0 {
+		fuaWrite := (command == nbdCmdWrite || command == nbdCmdTrim || command == nbdCmdWriteZeroes) && typeAndFlags&nbdCmdFlagFUA != 0
+		if fuaWrite {
 			if device.RemoteFlushEnabled() {
 				dispatchBarrier(handle, requestErr)
 			} else {
