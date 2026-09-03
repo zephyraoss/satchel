@@ -117,6 +117,7 @@ satchel vol rm app-data
 | `--s3-bucket` | `SATCHEL_S3_BUCKET` | required |
 | `--s3-access-key` | `SATCHEL_S3_ACCESS_KEY` | `AWS_ACCESS_KEY_ID` |
 | `--s3-secret-key` | `SATCHEL_S3_SECRET_KEY` | `AWS_SECRET_ACCESS_KEY` |
+| `--s3-path-style` | `SATCHEL_S3_PATH_STYLE` | `true` |
 | `--s3-head` | `SATCHEL_S3_HEAD` | `conditional` |
 | `--lease-ttl` | `SATCHEL_LEASE_TTL` | `30s` |
 | `--sync-interval` | `SATCHEL_SYNC_INTERVAL` | `5s` |
