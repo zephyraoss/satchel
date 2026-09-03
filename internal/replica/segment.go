@@ -295,6 +295,9 @@ func applyRuns(f *os.File, size int64, runs []decodedRun, selected []Extent) err
 			selected[i] = run.extent
 		}
 	}
+	if size < 0 {
+		return errors.New("segment cannot be applied to a negative-size image")
+	}
 	imageBlocks := uint64(size / DefaultBlockSize)
 	for _, run := range runs {
 		for _, overlap := range intersectExtent(run.extent, selected) {
