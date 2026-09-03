@@ -2044,11 +2044,11 @@ func TestPublishNeverCommitsUnstoredManifestBody(t *testing.T) {
 	}
 
 	state := lease.State()
-	headBody := len(state.InlineManifests[state.Manifest])
-	if headBody == 0 {
-		if _, err := store.Get(ctx, state.Manifest); err != nil {
-			t.Fatalf("published head manifest %s is neither inline nor stored (remaining inline was %d): %v", state.Manifest, remaining, err)
-		}
+	if len(state.InlineManifests[state.Manifest]) != 0 {
+		t.Fatalf("head manifest was embedded inline (remaining inline %d); the test no longer exercises the archive fallback", remaining)
+	}
+	if _, err := store.Get(ctx, state.Manifest); err != nil {
+		t.Fatalf("published head manifest %s is neither inline nor stored (remaining inline was %d): %v", state.Manifest, remaining, err)
 	}
 	path := filepath.Join(t.TempDir(), "restored")
 	if _, err := remote.Restore(ctx, "dangling", path); err != nil {

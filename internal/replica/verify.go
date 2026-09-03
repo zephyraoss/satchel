@@ -4,9 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
-	"strings"
 )
 
 // VerifyOptions controls how much data VerifyMetadataWithOptions fetches.
@@ -53,7 +51,7 @@ func (r *Remote) VerifyMetadataWithOptions(ctx context.Context, state State, opt
 	}
 
 	sources := newManifestSourceLoader(r.Store, state)
-	fetched := map[string]error{}
+	fetched := map[string]fetchedObject{}
 	for _, entry := range history {
 		for index, ref := range entry.manifest.Segments {
 			report.RefsChecked++
@@ -82,11 +80,17 @@ func (r *Remote) VerifyMetadataWithOptions(ctx context.Context, state State, opt
 	return report, ctx.Err()
 }
 
+type fetchedObject struct {
+	digest string
+	size   int64
+	err    error
+}
+
 func (r *Remote) verifyRef(
 	ctx context.Context,
 	sources *manifestSourceLoader,
 	opts VerifyOptions,
-	fetched map[string]error,
+	fetched map[string]fetchedObject,
 	report *VerifyReport,
 	ref ObjectRef,
 ) string {
@@ -94,62 +98,34 @@ func (r *Remote) verifyRef(
 	case ref.Key != "":
 		result, seen := fetched[ref.Key]
 		if !seen {
-			result = r.verifyExternal(ctx, opts, report, ref)
+			result = r.fetchExternal(ctx, opts, report, ref.Key)
 			fetched[ref.Key] = result
 		}
-		if result != nil {
-			return result.Error()
+		if result.err != nil {
+			return result.err.Error()
+		}
+		if opts.Deep && (result.size != ref.Bytes || result.digest != ref.SHA256) {
+			return fmt.Sprintf("segment object %s content does not match its reference", ref.Key)
 		}
 	case ref.SourceManifest != "":
-		if err := verifySourceRef(ctx, sources, ref); err != nil {
+		if _, _, err := sources.inlineSegment(ctx, ref); err != nil {
 			return err.Error()
 		}
 	}
 	return ""
 }
 
-func (r *Remote) verifyExternal(ctx context.Context, opts VerifyOptions, report *VerifyReport, ref ObjectRef) error {
-	obj, err := r.Store.Get(ctx, ref.Key)
+func (r *Remote) fetchExternal(ctx context.Context, opts VerifyOptions, report *VerifyReport, key string) fetchedObject {
+	obj, err := r.Store.Get(ctx, key)
 	if err != nil {
-		return fmt.Errorf("segment object %s: %v", ref.Key, err)
+		return fetchedObject{err: fmt.Errorf("segment object %s: %v", key, err)}
 	}
 	report.BytesFetched += int64(len(obj.Data))
+	report.ExternalObjects++
+	result := fetchedObject{size: int64(len(obj.Data))}
 	if opts.Deep {
 		digest := sha256.Sum256(obj.Data)
-		if int64(len(obj.Data)) != ref.Bytes || hex.EncodeToString(digest[:]) != ref.SHA256 {
-			return fmt.Errorf("segment object %s content does not match its reference", ref.Key)
-		}
+		result.digest = hex.EncodeToString(digest[:])
 	}
-	report.ExternalObjects++
-	return nil
-}
-
-func verifySourceRef(ctx context.Context, sources *manifestSourceLoader, ref ObjectRef) error {
-	var body []byte
-	var err error
-	if ref.SourceBundle != "" {
-		body, err = sources.manifestBody(ctx, ref.SourceBundle, ref.SourceManifest)
-	} else {
-		body, err = sources.resolve(ctx, ref.SourceManifest)
-	}
-	if err != nil {
-		return fmt.Errorf("source manifest %s is unresolvable: %v", ref.SourceManifest, err)
-	}
-	digest := sha256.Sum256(body)
-	if !strings.HasSuffix(ref.SourceManifest, "/manifests/"+hex.EncodeToString(digest[:])+".json") {
-		return fmt.Errorf("source manifest %s checksum mismatch", ref.SourceManifest)
-	}
-	var source Manifest
-	if err := json.Unmarshal(body, &source); err != nil {
-		return fmt.Errorf("decode source manifest %s: %v", ref.SourceManifest, err)
-	}
-	if int(ref.SourceIndex) >= len(source.Segments) {
-		return fmt.Errorf("source index %d is outside manifest %s", ref.SourceIndex, ref.SourceManifest)
-	}
-	sourceRef := source.Segments[ref.SourceIndex]
-	if len(sourceRef.InlineData) == 0 || sourceRef.SHA256 != ref.SHA256 ||
-		sourceRef.Bytes != ref.Bytes || sourceRef.Blocks != ref.Blocks {
-		return fmt.Errorf("inline segment %d in manifest %s does not match its reference", ref.SourceIndex, ref.SourceManifest)
-	}
-	return nil
+	return result
 }

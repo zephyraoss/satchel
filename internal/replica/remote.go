@@ -379,15 +379,12 @@ func (l *Lease) State() State {
 }
 
 func (l *Lease) update(ctx context.Context, mutate func(*State) error) error {
+	if err := l.resolvePending(ctx); err != nil {
+		return err
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.lost || l.state.Lease == nil {
-		return ErrLeaseLost
-	}
-	if err := l.resolvePendingLocked(ctx); err != nil {
-		return err
-	}
-	if l.state.Lease == nil {
 		return ErrLeaseLost
 	}
 	candidate := cloneState(l.state)
@@ -417,14 +414,23 @@ func (l *Lease) update(ctx context.Context, mutate func(*State) error) error {
 	return nil
 }
 
-func (l *Lease) resolvePendingLocked(ctx context.Context) error {
+func (l *Lease) resolvePending(ctx context.Context) error {
+	l.mu.Lock()
 	pending := l.pending
-	if pending == nil {
+	if pending == nil || l.lost || l.state.Lease == nil {
+		l.mu.Unlock()
 		return nil
 	}
-	currentBody, currentCursor, err := l.remote.readHeadBody(ctx, l.state.Name)
+	name := l.state.Name
+	l.mu.Unlock()
+	currentBody, currentCursor, err := l.remote.readHeadBody(ctx, name)
 	if err != nil {
 		return err
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.pending != pending {
+		return nil
 	}
 	l.pending = nil
 	if bytes.Equal(currentBody, pending.body) {
@@ -479,6 +485,27 @@ func (l *Lease) commitState(ctx context.Context, body []byte, candidate State) (
 	return "", err
 }
 
+func (l *Lease) renewLocked(ctx context.Context) {
+	if l.state.Lease == nil || l.state.Lease.ExpiresAt.After(l.remote.now().Add(l.remote.ttl()/2)) {
+		return
+	}
+	candidate := cloneState(l.state)
+	candidate.Lease.ExpiresAt = l.remote.now().Add(l.remote.ttl())
+	body, err := json.Marshal(candidate)
+	if err != nil {
+		return
+	}
+	etag, err := l.commitState(ctx, body, candidate)
+	if errors.Is(err, objectstore.ErrPreconditionFailed) {
+		l.lost = true
+		return
+	}
+	if err != nil {
+		return
+	}
+	l.applyCommitLocked(candidate, etag, nil)
+}
+
 func (l *Lease) Renew(ctx context.Context) error {
 	return l.update(ctx, func(state *State) error {
 		state.Lease.ExpiresAt = l.remote.now().Add(l.remote.ttl())
@@ -490,10 +517,15 @@ func (l *Lease) Publish(ctx context.Context, segments ...Segment) error {
 	if len(segments) == 0 {
 		return errors.New("cannot publish an empty generation")
 	}
-	for _, segment := range segments {
-		if segment.SHA256 == "" || len(segment.Data) == 0 || len(segment.Extents) == 0 {
-			return errors.New("invalid segment")
+	for index, segment := range segments {
+		digest := sha256.Sum256(segment.Data)
+		if len(segment.Data) == 0 || len(segment.Extents) == 0 ||
+			segment.SHA256 != hex.EncodeToString(digest[:]) || segment.Bytes != int64(len(segment.Data)) {
+			return fmt.Errorf("segment %d metadata does not match its data", index)
 		}
+	}
+	if err := l.resolvePending(ctx); err != nil {
+		return err
 	}
 	l.mu.Lock()
 	if l.lost || l.state.Lease == nil {
@@ -501,6 +533,7 @@ func (l *Lease) Publish(ctx context.Context, segments ...Segment) error {
 		return ErrLeaseLost
 	}
 	if l.consumeAdoptedPublishLocked(segments) {
+		l.renewLocked(ctx)
 		l.mu.Unlock()
 		return nil
 	}
@@ -552,12 +585,17 @@ func (l *Lease) consumeAdoptedPublishLocked(segments []Segment) bool {
 		return false
 	}
 	for index, segment := range segments {
-		if adopted.Segments[index].SHA256 != segment.SHA256 {
+		if !sameSegmentReference(adopted.Segments[index], segment) {
 			return false
 		}
 	}
 	l.adoptedManifest = nil
 	return true
+}
+
+func sameSegmentReference(ref ObjectRef, segment Segment) bool {
+	return ref.SHA256 == segment.SHA256 && ref.Bytes == segment.Bytes && ref.Blocks == segment.Blocks &&
+		reflect.DeepEqual(ref.Extents, segment.Extents) && reflect.DeepEqual(ref.ZeroExtents, segment.ZeroExtents)
 }
 
 func (l *Lease) uploadSegments(ctx context.Context, snapshot State, segments []Segment) ([]ObjectRef, error) {
@@ -1001,20 +1039,18 @@ func (l *Lease) commitManifest(
 	embed bool,
 	bundle *preparedManifestBundle,
 ) error {
+	if err := l.resolvePending(ctx); err != nil {
+		return err
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.lost || l.state.Lease == nil {
 		return ErrLeaseLost
 	}
-	if err := l.resolvePendingLocked(ctx); err != nil {
-		return err
-	}
 	if adopted := l.adoptedManifest; adopted != nil && sameLogicalManifest(*adopted, prepared.manifest) {
 		l.adoptedManifest = nil
+		l.renewLocked(ctx)
 		return nil
-	}
-	if l.state.Lease == nil {
-		return ErrLeaseLost
 	}
 	if l.state.Generation != snapshot.Generation || l.state.Manifest != snapshot.Manifest || l.state.Epoch != snapshot.Epoch {
 		return errors.New("volume head changed during publish")
@@ -1496,10 +1532,22 @@ func (l *Lease) CollectGarbage(ctx context.Context, opts GCOptions) (GCResult, e
 	}
 	state := cloneState(l.state)
 	l.mu.Unlock()
-	return l.remote.collectGarbage(ctx, state, opts)
+	return l.remote.collectGarbage(ctx, state, opts, l.stillHeld)
 }
 
-func (r *Remote) collectGarbage(ctx context.Context, state State, opts GCOptions) (GCResult, error) {
+func (l *Lease) stillHeld() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.lost || l.state.Lease == nil {
+		return ErrLeaseLost
+	}
+	return nil
+}
+
+func (r *Remote) collectGarbage(ctx context.Context, state State, opts GCOptions, stillHeld func() error) (GCResult, error) {
+	if stillHeld == nil {
+		stillHeld = func() error { return nil }
+	}
 	history, err := r.loadHistory(ctx, state)
 	if err != nil {
 		return GCResult{}, err
@@ -1576,9 +1624,15 @@ func (r *Remote) collectGarbage(ctx context.Context, state State, opts GCOptions
 		if record.CreatedAt.Add(opts.GracePeriod).After(now) {
 			continue
 		}
+		if err := stillHeld(); err != nil {
+			return result, err
+		}
 		for _, candidate := range record.Objects {
 			if _, retained := keep[candidate]; retained || !isImmutableObject(prefix, candidate) {
 				continue
+			}
+			if err := ctx.Err(); err != nil {
+				return result, err
 			}
 			if err := r.Store.Delete(ctx, candidate); err != nil {
 				return result, fmt.Errorf("delete garbage object %s: %w", candidate, err)
@@ -1608,6 +1662,11 @@ func (r *Remote) collectGarbage(ctx context.Context, state State, opts GCOptions
 		candidates = append(candidates, key)
 	}
 	sort.Strings(candidates)
+	if len(candidates) > 0 {
+		if err := stillHeld(); err != nil {
+			return result, err
+		}
+	}
 	const objectsPerRecord = 1000
 	for len(candidates) > 0 {
 		count := min(len(candidates), objectsPerRecord)
@@ -1769,7 +1828,11 @@ func (l *manifestSourceLoader) resolve(ctx context.Context, manifestKey string) 
 	if body, ok := l.inline[manifestKey]; ok {
 		return body, nil
 	}
-	if body := l.searchBundleChain(ctx, manifestKey, nil); body != nil {
+	body, err := l.searchBundleChain(ctx, manifestKey, nil)
+	if err != nil && !errors.Is(err, objectstore.ErrNotFound) {
+		return nil, err
+	}
+	if body != nil {
 		return body, nil
 	}
 	obj, err := l.store.Get(ctx, manifestKey)
@@ -1788,32 +1851,67 @@ func (l *manifestSourceLoader) findBundlePath(ctx context.Context, manifestKey s
 		return nil, nil
 	}
 	var path []string
-	if body := l.searchBundleChain(ctx, manifestKey, &path); body != nil {
+	body, err := l.searchBundleChain(ctx, manifestKey, &path)
+	if err != nil {
+		return nil, err
+	}
+	if body != nil {
 		return path, nil
 	}
 	return nil, nil
 }
 
-func (l *manifestSourceLoader) searchBundleChain(ctx context.Context, manifestKey string, path *[]string) []byte {
+func (l *manifestSourceLoader) searchBundleChain(ctx context.Context, manifestKey string, path *[]string) ([]byte, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	ref := l.head
 	for ref != nil {
 		bundle, err := l.loadBundleLocked(ctx, ref.Key)
 		if err != nil {
-			return nil
+			return nil, err
 		}
 		if path != nil {
 			*path = append(*path, ref.Key)
 		}
 		for _, entry := range bundle.Manifests {
 			if entry.Key == manifestKey {
-				return entry.Body
+				return entry.Body, nil
 			}
 		}
 		ref = bundle.Parent
 	}
-	return nil
+	return nil, nil
+}
+
+func (l *manifestSourceLoader) inlineSegment(ctx context.Context, ref ObjectRef) ([]byte, string, error) {
+	var sourceBody []byte
+	var err error
+	if ref.SourceBundle != "" {
+		sourceBody, err = l.manifestBody(ctx, ref.SourceBundle, ref.SourceManifest)
+	} else {
+		sourceBody, err = l.resolve(ctx, ref.SourceManifest)
+	}
+	if err != nil {
+		return nil, "", fmt.Errorf("read inline segment manifest %s: %w", ref.SourceManifest, err)
+	}
+	digest := sha256.Sum256(sourceBody)
+	if !strings.HasSuffix(ref.SourceManifest, "/manifests/"+hex.EncodeToString(digest[:])+".json") {
+		return nil, "", fmt.Errorf("inline segment manifest %s checksum mismatch", ref.SourceManifest)
+	}
+	var source Manifest
+	if err := json.Unmarshal(sourceBody, &source); err != nil {
+		return nil, "", fmt.Errorf("decode inline segment manifest %s: %w", ref.SourceManifest, err)
+	}
+	if int(ref.SourceIndex) >= len(source.Segments) {
+		return nil, "", fmt.Errorf("inline segment index %d is outside manifest %s", ref.SourceIndex, ref.SourceManifest)
+	}
+	sourceRef := source.Segments[ref.SourceIndex]
+	dataDigest := sha256.Sum256(sourceRef.InlineData)
+	if len(sourceRef.InlineData) == 0 || sourceRef.SHA256 != ref.SHA256 || sourceRef.Bytes != ref.Bytes || sourceRef.Blocks != ref.Blocks ||
+		int64(len(sourceRef.InlineData)) != ref.Bytes || hex.EncodeToString(dataDigest[:]) != ref.SHA256 {
+		return nil, "", fmt.Errorf("inline segment %d in manifest %s does not match its reference", ref.SourceIndex, ref.SourceManifest)
+	}
+	return sourceRef.InlineData, fmt.Sprintf("%s[%d]", ref.SourceManifest, ref.SourceIndex), nil
 }
 
 func applyObjectRef(
@@ -1827,33 +1925,11 @@ func applyObjectRef(
 	data := ref.InlineData
 	label := ref.Key
 	if len(data) == 0 && ref.SourceManifest != "" {
-		var sourceBody []byte
 		var err error
-		if ref.SourceBundle != "" {
-			sourceBody, err = sources.manifestBody(ctx, ref.SourceBundle, ref.SourceManifest)
-		} else {
-			sourceBody, err = sources.resolve(ctx, ref.SourceManifest)
-		}
+		data, label, err = sources.inlineSegment(ctx, ref)
 		if err != nil {
-			return fmt.Errorf("read inline segment manifest %s: %w", ref.SourceManifest, err)
+			return err
 		}
-		digest := sha256.Sum256(sourceBody)
-		if !strings.HasSuffix(ref.SourceManifest, "/manifests/"+hex.EncodeToString(digest[:])+".json") {
-			return fmt.Errorf("inline segment manifest %s checksum mismatch", ref.SourceManifest)
-		}
-		var source Manifest
-		if err := json.Unmarshal(sourceBody, &source); err != nil {
-			return fmt.Errorf("decode inline segment manifest %s: %w", ref.SourceManifest, err)
-		}
-		if int(ref.SourceIndex) >= len(source.Segments) {
-			return fmt.Errorf("inline segment index %d is outside manifest %s", ref.SourceIndex, ref.SourceManifest)
-		}
-		sourceRef := source.Segments[ref.SourceIndex]
-		if len(sourceRef.InlineData) == 0 || sourceRef.SHA256 != ref.SHA256 || sourceRef.Bytes != ref.Bytes || sourceRef.Blocks != ref.Blocks {
-			return fmt.Errorf("inline segment %d in manifest %s does not match its reference", ref.SourceIndex, ref.SourceManifest)
-		}
-		data = sourceRef.InlineData
-		label = fmt.Sprintf("%s[%d]", ref.SourceManifest, ref.SourceIndex)
 	} else if len(data) == 0 {
 		obj, err := store.Get(ctx, ref.Key)
 		if err != nil {
