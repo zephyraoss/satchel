@@ -19,16 +19,21 @@ CYCLES=${1:-8}
 : "${SATCHEL_LEASE_TTL:=30s}"
 
 duration_seconds() {
-  case "$1" in
-    *h) echo $(( ${1%h} * 3600 )) ;;
-    *m) echo $(( ${1%m} * 60 )) ;;
-    *s) echo "${1%s}" ;;
-    *) echo "$1" ;;
-  esac
+  local value=$1 total=0
+  if [[ "$value" =~ ^[0-9]+$ ]]; then
+    echo "$value"
+    return 0
+  fi
+  if ! [[ "$value" =~ ^([0-9]+h)?([0-9]+m)?([0-9]+s)?$ ]] || [[ -z "$value" ]]; then
+    return 1
+  fi
+  [[ -n "${BASH_REMATCH[1]}" ]] && total=$(( total + ${BASH_REMATCH[1]%h} * 3600 ))
+  [[ -n "${BASH_REMATCH[2]}" ]] && total=$(( total + ${BASH_REMATCH[2]%m} * 60 ))
+  [[ -n "${BASH_REMATCH[3]}" ]] && total=$(( total + ${BASH_REMATCH[3]%s} ))
+  echo "$total"
 }
-lease_ttl_seconds=$(duration_seconds "$SATCHEL_LEASE_TTL")
-if ! [[ "$lease_ttl_seconds" =~ ^[0-9]+$ ]]; then
-  echo "SATCHEL_LEASE_TTL must be an integer number of seconds, minutes, or hours (got $SATCHEL_LEASE_TTL)" >&2
+if ! lease_ttl_seconds=$(duration_seconds "$SATCHEL_LEASE_TTL"); then
+  echo "SATCHEL_LEASE_TTL must be a whole number of seconds or an integer h/m/s duration such as 30s or 1h30m (got $SATCHEL_LEASE_TTL)" >&2
   exit 2
 fi
 : "${SATCHEL_FAULT_S3_OUTAGE_SECONDS:=$(( lease_ttl_seconds * 2 ))}"
