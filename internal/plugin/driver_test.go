@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -132,6 +133,9 @@ func TestFilesystemFlushPublishesRemoteGeneration(t *testing.T) {
 	store := &blockingManifestStore{
 		Store: objectstore.NewMemory(), started: make(chan struct{}), release: make(chan struct{}),
 	}
+	var releaseOnce sync.Once
+	releaseCheckpoint := func() { releaseOnce.Do(func() { close(store.release) }) }
+	t.Cleanup(releaseCheckpoint)
 	driver, backend := newTestDriver(t, store, "node-a")
 	if err := driver.Create(&volume.CreateRequest{Name: "data", Options: map[string]string{"size": "64MiB"}}); err != nil {
 		t.Fatal(err)
@@ -162,7 +166,7 @@ func TestFilesystemFlushPublishesRemoteGeneration(t *testing.T) {
 	if after.Generation <= before.Generation {
 		t.Fatalf("state after flush = %+v, want a published generation", after)
 	}
-	close(store.release)
+	releaseCheckpoint()
 	if err := driver.Unmount(&volume.UnmountRequest{Name: "data", ID: "container"}); err != nil {
 		t.Fatal(err)
 	}

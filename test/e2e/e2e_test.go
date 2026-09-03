@@ -503,7 +503,11 @@ func mountAndCheck(t *testing.T, image string, want map[string]string) error {
 	if out, err := exec.Command("mount", "-o", "ro,loop", image, dir).CombinedOutput(); err != nil {
 		return errors.New("mount restored image: " + err.Error() + ": " + string(out))
 	}
-	defer exec.Command("umount", dir).Run()
+	defer func() {
+		if out, err := exec.Command("umount", dir).CombinedOutput(); err != nil {
+			t.Errorf("umount %s: %v: %s", dir, err, out)
+		}
+	}()
 	for file, contents := range want {
 		got, err := os.ReadFile(filepath.Join(dir, file))
 		if err != nil {
@@ -577,6 +581,9 @@ func TestSimultaneousMountRaceAdmitsExactlyOneWriter(t *testing.T) {
 				continue
 			}
 			t.Logf("loser %s rejected: %v", result.id, result.err)
+			if !strings.Contains(result.err.Error(), "is held by") && !errors.Is(result.err, replica.ErrLeaseLost) {
+				t.Fatalf("racer %s failed for a reason other than lease contention: %v", result.id, result.err)
+			}
 		}
 		if winner == "" {
 			t.Fatal("no racing node acquired the volume")
