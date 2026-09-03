@@ -222,7 +222,7 @@ func newVolRestoreCommand(opts *volOptions) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if err := os.Link(partial, args[1]); err != nil {
+			if err := os.Rename(partial, args[1]); err != nil {
 				return fmt.Errorf("finalize restore: %w", err)
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "restored %s generation %d to %s\n", state.Name, state.Generation, args[1])
