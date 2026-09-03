@@ -29,6 +29,22 @@ func e2eEnvOr(name, fallback string) string {
 	return fallback
 }
 
+func e2eHeadMode(t *testing.T) replica.HeadMode {
+	mode, err := replica.ParseHeadMode(os.Getenv("SATCHEL_E2E_S3_HEAD"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return mode
+}
+
+func e2eRemote(t *testing.T, store objectstore.Store, ttl time.Duration) *replica.Remote {
+	remote := &replica.Remote{Store: store, Head: e2eHeadMode(t), TTL: ttl}
+	if err := remote.VerifyBackend(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	return remote
+}
+
 func e2eS3Config(endpoint string) objectstore.S3Config {
 	return objectstore.S3Config{
 		Endpoint:       endpoint,
@@ -56,16 +72,13 @@ func TestVolumeMovesBetweenNodes(t *testing.T) {
 	}
 	cfg := e2eS3Config(endpoint)
 	store := objectstore.NewS3(cfg)
-	if err := objectstore.VerifyConditionalWrites(context.Background(), store); err != nil {
-		t.Fatal(err)
-	}
 	name := "e2e-" + time.Now().Format("150405.000000000")
 	t.Cleanup(func() { _ = store.DeletePrefix(context.Background(), replica.VolumePrefix(name)) })
 
 	node := func(id string) *plugin.Driver {
 		driver, err := plugin.New(
 			plugin.Config{NodeID: id, StateDir: filepath.Join(t.TempDir(), id), CheckpointInterval: 1},
-			&replica.Remote{Store: store, TTL: 10 * time.Second},
+			e2eRemote(t, store, 10*time.Second),
 			block.New(block.Options{}),
 		)
 		if err != nil {
@@ -96,7 +109,7 @@ func TestVolumeMovesBetweenNodes(t *testing.T) {
 	if err := file.Close(); err != nil {
 		t.Fatal(err)
 	}
-	durable, _, err := (&replica.Remote{Store: store}).Inspect(context.Background(), name)
+	durable, _, err := e2eRemote(t, store, 0).Inspect(context.Background(), name)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +119,7 @@ func TestVolumeMovesBetweenNodes(t *testing.T) {
 	if err := first.Unmount(&volume.UnmountRequest{Name: name, ID: "writer-a"}); err != nil {
 		t.Fatal(err)
 	}
-	state, _, err := (&replica.Remote{Store: store}).Inspect(context.Background(), name)
+	state, _, err := e2eRemote(t, store, 0).Inspect(context.Background(), name)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,9 +191,6 @@ func TestConcurrentWriterIsFencedAfterTakeover(t *testing.T) {
 	}
 	cfg := e2eS3Config(endpoint)
 	store := objectstore.NewS3(cfg)
-	if err := objectstore.VerifyConditionalWrites(context.Background(), store); err != nil {
-		t.Fatal(err)
-	}
 	ctx := context.Background()
 	name := "fence-" + time.Now().Format("150405.000000000")
 	t.Cleanup(func() { _ = store.DeletePrefix(ctx, replica.VolumePrefix(name)) })
@@ -189,7 +199,7 @@ func TestConcurrentWriterIsFencedAfterTakeover(t *testing.T) {
 	node := func(id string) *plugin.Driver {
 		driver, err := plugin.New(
 			plugin.Config{NodeID: id, StateDir: filepath.Join(t.TempDir(), id), CheckpointInterval: 1, SyncInterval: time.Hour},
-			&replica.Remote{Store: store, TTL: 5 * time.Minute},
+			e2eRemote(t, store, 5*time.Minute),
 			block.New(block.Options{}),
 		)
 		if err != nil {
@@ -197,7 +207,7 @@ func TestConcurrentWriterIsFencedAfterTakeover(t *testing.T) {
 		}
 		return driver
 	}
-	inspect := &replica.Remote{Store: store}
+	inspect := e2eRemote(t, store, 0)
 
 	nodeA := node("node-a")
 	if err := nodeA.Create(&volume.CreateRequest{Name: name, Options: map[string]string{"size": "64MiB"}}); err != nil {
@@ -238,6 +248,10 @@ func TestConcurrentWriterIsFencedAfterTakeover(t *testing.T) {
 	if err := inspect.Break(ctx, name, held.Lease.Token); err != nil {
 		t.Fatalf("break lease: %v", err)
 	}
+	broken, _, err := inspect.Inspect(ctx, name)
+	if err != nil {
+		t.Fatal(err)
+	}
 	nodeB := node("node-b")
 	mountB, err := nodeB.Mount(&volume.MountRequest{Name: name, ID: "writer-b"})
 	if err != nil {
@@ -250,8 +264,8 @@ func TestConcurrentWriterIsFencedAfterTakeover(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if afterTakeover.Lease == nil || afterTakeover.Lease.Holder != "node-b" || afterTakeover.Lease.Epoch != held.Lease.Epoch+1 {
-		t.Fatalf("takeover lease = %+v, want node-b at epoch %d", afterTakeover.Lease, held.Lease.Epoch+1)
+	if afterTakeover.Lease == nil || afterTakeover.Lease.Holder != "node-b" || afterTakeover.Lease.Epoch != broken.Epoch+1 {
+		t.Fatalf("takeover lease = %+v, want node-b at epoch %d", afterTakeover.Lease, broken.Epoch+1)
 	}
 
 	// Node A is now a superseded zombie holding a live NBD mount. Forcing a
@@ -315,6 +329,13 @@ func (s *partitionableStore) Get(ctx context.Context, key string) (objectstore.O
 	return s.Store.Get(ctx, key)
 }
 
+func (s *partitionableStore) Put(ctx context.Context, key string, data []byte) (string, error) {
+	if s.partitioned.Load() {
+		return "", errPartitioned
+	}
+	return s.Store.Put(ctx, key, data)
+}
+
 func (s *partitionableStore) PutIfAbsent(ctx context.Context, key string, data []byte) (string, error) {
 	if s.partitioned.Load() {
 		return "", errPartitioned
@@ -366,9 +387,6 @@ func TestPartitionedWriterSelfFencesAndYields(t *testing.T) {
 	}
 	cfg := e2eS3Config(endpoint)
 	rawStore := objectstore.NewS3(cfg)
-	if err := objectstore.VerifyConditionalWrites(context.Background(), rawStore); err != nil {
-		t.Fatal(err)
-	}
 	ctx := context.Background()
 	name := "partition-" + time.Now().Format("150405.000000000")
 	t.Cleanup(func() { _ = rawStore.DeletePrefix(ctx, replica.VolumePrefix(name)) })
@@ -379,7 +397,7 @@ func TestPartitionedWriterSelfFencesAndYields(t *testing.T) {
 	node := func(id string, store objectstore.Store) *plugin.Driver {
 		driver, err := plugin.New(
 			plugin.Config{NodeID: id, StateDir: filepath.Join(t.TempDir(), id), CheckpointInterval: 1, SyncInterval: time.Hour},
-			&replica.Remote{Store: store, TTL: ttl},
+			e2eRemote(t, store, ttl),
 			block.New(block.Options{}),
 		)
 		if err != nil {
@@ -387,7 +405,7 @@ func TestPartitionedWriterSelfFencesAndYields(t *testing.T) {
 		}
 		return driver
 	}
-	inspect := &replica.Remote{Store: rawStore}
+	inspect := e2eRemote(t, rawStore, 0)
 
 	partitioned := &partitionableStore{Store: rawStore}
 	nodeA := node("node-a", partitioned)
@@ -514,9 +532,6 @@ func TestSimultaneousMountRaceAdmitsExactlyOneWriter(t *testing.T) {
 	}
 	cfg := e2eS3Config(endpoint)
 	store := objectstore.NewS3(cfg)
-	if err := objectstore.VerifyConditionalWrites(context.Background(), store); err != nil {
-		t.Fatal(err)
-	}
 	ctx := context.Background()
 	name := "race-" + time.Now().Format("150405.000000000")
 	t.Cleanup(func() { _ = store.DeletePrefix(ctx, replica.VolumePrefix(name)) })
@@ -524,7 +539,7 @@ func TestSimultaneousMountRaceAdmitsExactlyOneWriter(t *testing.T) {
 	node := func(id string) *plugin.Driver {
 		driver, err := plugin.New(
 			plugin.Config{NodeID: id, StateDir: filepath.Join(t.TempDir(), id), CheckpointInterval: 1, SyncInterval: time.Hour},
-			&replica.Remote{Store: store, TTL: 10 * time.Second},
+			e2eRemote(t, store, 10*time.Second),
 			block.New(block.Options{}),
 		)
 		if err != nil {

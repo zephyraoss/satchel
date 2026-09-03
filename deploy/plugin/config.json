@@ -40,6 +40,7 @@
     { "name": "SATCHEL_S3_ACCESS_KEY", "settable": ["value"] },
     { "name": "SATCHEL_S3_SECRET_KEY", "settable": ["value"] },
     { "name": "SATCHEL_S3_PATH_STYLE", "settable": ["value"], "value": "true" },
+    { "name": "SATCHEL_S3_HEAD", "settable": ["value"], "value": "conditional" },
     { "name": "SATCHEL_LEASE_TTL", "settable": ["value"], "value": "30s" },
     { "name": "SATCHEL_SYNC_INTERVAL", "settable": ["value"], "value": "5s" },
     { "name": "SATCHEL_DIRTY_LIMIT", "settable": ["value"], "value": "256MiB" },

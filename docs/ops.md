@@ -12,7 +12,13 @@ The service also needs `CAP_SYS_ADMIN`, `mkfs.ext4`, and `mount`.
 
 ## S3 requirements
 
-The bucket must implement conditional `PUT` requests with `If-Match` and `If-None-Match`. Satchel verifies both operations at startup. AWS S3, MinIO, and compatible services with those semantics work.
+The default head protocol (`--s3-head=conditional`) needs conditional `PUT` requests with `If-Match` and `If-None-Match`. Satchel verifies both operations at startup and refuses to run if the backend ignores them. AWS S3, MinIO, Cloudflare R2, and compatible services with those semantics work.
+
+Garage does not implement conditional writes and its maintainers consider them out of scope, so run Satchel against Garage with `--s3-head=append` (`SATCHEL_S3_HEAD=append`). That mode replaces the single `If-Match` object with an append-only version log and a settle window on takeover; the startup probe then checks read-after-write listing instead. The append head is safe for one writer per volume but relies on bounded clock skew between nodes rather than a server-side compare-and-swap, so keep NTP running on every node and give it its own bucket: a volume published in one head mode cannot be opened in the other, and Satchel reports which mode a volume needs when that happens.
+
+### Append head takeover
+
+With the append head, lease takeover writes a claim version, waits for the settle window (three seconds by default), lists the head prefix, and proceeds only if no other node claimed a newer epoch in the meantime. Two nodes racing for an expired lease both back off when they see each other, then retry. A claim that took longer than half the settle window to reach the bucket is discarded rather than trusted. A stale writer is fenced by its next state write: every write lists the prefix afterwards and fails with lease loss when a newer epoch exists. That check costs one LIST per publish, so commit latency on Garage is one PUT plus one LIST rather than one conditional PUT.
 
 ## Lease recovery
 

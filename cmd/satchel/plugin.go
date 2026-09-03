@@ -35,6 +35,7 @@ type pluginOptions struct {
 	historyRetention   time.Duration
 	gcGrace            time.Duration
 	s3                 objectstore.S3Config
+	s3Head             string
 	logLevel           string
 	dirtyLimit         string
 }
@@ -64,13 +65,14 @@ func bindPluginFlags(cmd *cobra.Command, opts *pluginOptions) {
 	f.Uint64Var(&opts.checkpointInterval, "checkpoint-interval", envUint64Or("SATCHEL_CHECKPOINT_INTERVAL", 128), "compact the restore chain after this many generations")
 	f.DurationVar(&opts.historyRetention, "history-retention", envDurationOr("SATCHEL_HISTORY_RETENTION", 7*24*time.Hour), "retain point-in-time generations for at least this long")
 	f.DurationVar(&opts.gcGrace, "gc-grace", envDurationOr("SATCHEL_GC_GRACE", 24*time.Hour), "wait this long before deleting unreachable objects")
-	bindS3Flags(cmd, &opts.s3)
+	bindS3Flags(cmd, &opts.s3, &opts.s3Head)
 	f.StringVar(&opts.logLevel, "log-level", envOr("SATCHEL_LOG_LEVEL", "info"), "debug|info|warn|error")
 	f.StringVar(&opts.dirtyLimit, "dirty-limit", envOr("SATCHEL_DIRTY_LIMIT", "256MiB"), "pause writes when unpublished block generations exceed this size")
 }
 
-func bindS3Flags(cmd *cobra.Command, opts *objectstore.S3Config) {
+func bindS3Flags(cmd *cobra.Command, opts *objectstore.S3Config, head *string) {
 	f := cmd.Flags()
+	f.StringVar(head, "s3-head", envOr("SATCHEL_S3_HEAD", string(replica.ConditionalHead)), "volume head protocol: conditional (If-Match, AWS/MinIO/R2) or append (listing-based, Garage)")
 	f.StringVar(&opts.Endpoint, "s3-endpoint", envOr("SATCHEL_S3_ENDPOINT", ""), "S3 endpoint URL (empty for AWS)")
 	f.StringVar(&opts.Region, "s3-region", envOr("SATCHEL_S3_REGION", "us-east-1"), "S3 region")
 	f.StringVar(&opts.Bucket, "s3-bucket", envOr("SATCHEL_S3_BUCKET", ""), "S3 bucket holding volumes and leases")
@@ -122,13 +124,29 @@ func buildDriver(ctx context.Context, opts pluginOptions) (*plugin.Driver, *slog
 		return nil, nil, errors.New("--s3-bucket (SATCHEL_S3_BUCKET) is required")
 	}
 
+	headMode, err := replica.ParseHeadMode(opts.s3Head)
+	if err != nil {
+		return nil, nil, fmt.Errorf("--s3-head: %w", err)
+	}
 	store := objectstore.NewS3(opts.s3)
+	remote := &replica.Remote{
+		Store: store, Head: headMode, TTL: opts.leaseTTL,
+		Observe: func(stage string, duration time.Duration) {
+			metrics.ReplicationStageDuration.WithLabelValues(stage).Observe(duration.Seconds())
+		},
+		ObserveGeneration: func(inputBytes, storedBytes int64, segments int) {
+			metrics.ReplicationGenerations.Inc()
+			metrics.ReplicationInputBytes.Add(float64(inputBytes))
+			metrics.ReplicationStoredBytes.Add(float64(storedBytes))
+			metrics.ReplicationSegments.Add(float64(segments))
+		},
+	}
 	probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	if err := objectstore.VerifyConditionalWrites(probeCtx, store); err != nil {
-		return nil, nil, fmt.Errorf("S3 backend %s is unusable: %w", opts.s3.Endpoint, err)
+	if err := remote.VerifyBackend(probeCtx); err != nil {
+		return nil, nil, fmt.Errorf("S3 backend %s is unusable with the %s head: %w", opts.s3.Endpoint, headMode, err)
 	}
-	logger.Info("conditional writes verified", "endpoint", opts.s3.Endpoint, "bucket", opts.s3.Bucket)
+	logger.Info("S3 backend verified", "endpoint", opts.s3.Endpoint, "bucket", opts.s3.Bucket, "head", headMode)
 
 	dirtyLimit, err := parseBytes(opts.dirtyLimit)
 	if err != nil {
@@ -141,18 +159,7 @@ func buildDriver(ctx context.Context, opts pluginOptions) (*plugin.Driver, *slog
 			HistoryRetention: opts.historyRetention, GCGrace: opts.gcGrace,
 			Logger: logger, Seeder: &seed.Seeder{Fetch: store.Fetch},
 		},
-		&replica.Remote{
-			Store: store, TTL: opts.leaseTTL,
-			Observe: func(stage string, duration time.Duration) {
-				metrics.ReplicationStageDuration.WithLabelValues(stage).Observe(duration.Seconds())
-			},
-			ObserveGeneration: func(inputBytes, storedBytes int64, segments int) {
-				metrics.ReplicationGenerations.Inc()
-				metrics.ReplicationInputBytes.Add(float64(inputBytes))
-				metrics.ReplicationStoredBytes.Add(float64(storedBytes))
-				metrics.ReplicationSegments.Add(float64(segments))
-			},
-		},
+		remote,
 		block.New(block.Options{Logger: logger}),
 	)
 	if err != nil {

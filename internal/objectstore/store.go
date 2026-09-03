@@ -17,6 +17,7 @@ type Object struct {
 
 type Store interface {
 	Get(ctx context.Context, key string) (Object, error)
+	Put(ctx context.Context, key string, data []byte) (etag string, err error)
 	PutIfAbsent(ctx context.Context, key string, data []byte) (etag string, err error)
 	PutIfMatch(ctx context.Context, key string, data []byte, etag string) (newETag string, err error)
 	Delete(ctx context.Context, key string) error

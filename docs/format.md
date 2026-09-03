@@ -9,7 +9,7 @@ manifest-bundles/<sha256>.json
 segments/e<epoch>-g<generation>-<sha256>.seg.gz
 ```
 
-Segment, manifest, and manifest-bundle objects are immutable. Their names contain a SHA-256 digest. Segment names also contain the writer epoch and generation, which prevents a garbage collector from racing with a later writer that happens to produce identical block data. `state.json` is the only mutable volume object. Its format identifier is `satchel-block-v1`.
+Segment, manifest, and manifest-bundle objects are immutable. Their names contain a SHA-256 digest. Segment names also contain the writer epoch and generation, which prevents a garbage collector from racing with a later writer that happens to produce identical block data. `state.json` is the only mutable volume object. Its format identifier is `satchel-block-v1`. Volumes published with the append head store the same state document under `heads/` instead of `state.json`; see [Append head](#append-head).
 
 ## State publication
 
@@ -22,6 +22,22 @@ Once the inline area reaches 16 KiB, Satchel starts packing it into one immutabl
 The lease and volume head share one conditional object. Once another node takes the lease, every publication attempt using the old ETag fails. This protects the committed history even if the old node has not unmounted yet.
 
 A generation object created with `If-None-Match: *` cannot replace this conditional head. That condition only proves that the generation key was unused. It does not prove that the caller still owns the lease, so a stale writer could otherwise acknowledge a generation after another node took over.
+
+## Append head
+
+Some backends, notably Garage, accept `If-Match` and `If-None-Match` headers but ignore them. `--s3-head=append` keeps the same state document but publishes it as an append-only log of immutable versions under `heads/`:
+
+```text
+heads/<inverted epoch>_<claim ms>_<lease token>_<inverted seq>.json
+```
+
+The epoch and sequence fields are zero-padded and inverted, so a plain sorted listing puts the newest version first. Every version is written with an unconditional PUT to a key that no other writer will ever use, so writers never overwrite each other; they only ever disagree about which key is the head. The head of a volume is the first listed version with a non-zero sequence.
+
+Taking or creating a lease writes a claim with sequence zero, waits for the settle window, and lists the prefix again. The claim stands only if no other claim or version with the same or a newer epoch appeared, and if the previous holder's head did not advance in the meantime. The claimant then writes sequence one and confirms it the same way. A claim whose PUT took longer than half the settle window is deleted and retried rather than trusted, which bounds the effect of a slow request landing after a competitor already checked. Claims older than the lease TTL that never reached sequence one are reaped by the next claimant.
+
+Publication, renewal, release, and break write the next sequence and then list the prefix. The write is committed only if it is the newest version and no newer epoch exists; a newer epoch means another node took over and the writer reports lease loss exactly as the conditional head does. The lease fence therefore depends on every node seeing its own writes in a listing immediately, which Garage provides, and on clock skew between nodes staying well under the settle window. Break and delete bump the epoch so a stale holder's next write lands in an old epoch and fails.
+
+Confirmed versions prune everything from older epochs and all but the two most recent sequences of the current one, so a volume keeps a handful of head objects rather than a growing log. Commit latency is one PUT plus one LIST instead of one conditional PUT. A volume is bound to the head mode it was created with; opening it in the other mode fails with an error naming the required flag.
 
 ## Segments
 

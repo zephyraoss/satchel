@@ -130,10 +130,15 @@ type CreateOptions struct {
 
 type Remote struct {
 	Store             objectstore.Store
+	Head              HeadMode
+	Settle            time.Duration
 	TTL               time.Duration
 	Now               func() time.Time
 	Observe           func(stage string, duration time.Duration)
 	ObserveGeneration func(inputBytes, storedBytes int64, segments int)
+
+	headOnce   sync.Once
+	volumeHead volumeHead
 }
 
 func (r *Remote) observeGeneration(generation *Generation, segments []Segment) {
@@ -171,18 +176,22 @@ func (r *Remote) ttl() time.Duration {
 }
 
 func (r *Remote) Inspect(ctx context.Context, name string) (State, string, error) {
-	obj, err := r.Store.Get(ctx, StateKey(name))
+	body, cursor, err := r.head().read(ctx, name)
 	if err != nil {
 		return State{}, "", err
 	}
 	var state State
-	if err := json.Unmarshal(obj.Data, &state); err != nil {
+	if err := json.Unmarshal(body, &state); err != nil {
 		return State{}, "", fmt.Errorf("decode volume state: %w", err)
 	}
 	if err := validateState(name, state); err != nil {
 		return State{}, "", err
 	}
-	return state, obj.ETag, nil
+	return state, cursor, nil
+}
+
+func (r *Remote) readHeadBody(ctx context.Context, name string) ([]byte, string, error) {
+	return r.head().read(ctx, name)
 }
 
 func validateState(name string, state State) error {
@@ -282,14 +291,13 @@ func (r *Remote) Acquire(ctx context.Context, name, holder string, opts CreateOp
 		return nil, false, err
 	}
 	if created {
-		etag, err = r.Store.PutIfAbsent(ctx, StateKey(name), body)
-	} else {
-		etag, err = r.Store.PutIfMatch(ctx, StateKey(name), body, etag)
+		etag = ""
 	}
+	etag, err = r.head().commit(ctx, name, body, etag, state)
 	if err != nil {
-		current, getErr := r.Store.Get(ctx, StateKey(name))
-		if getErr == nil && bytes.Equal(current.Data, body) {
-			etag, err = current.ETag, nil
+		currentBody, currentCursor, getErr := r.readHeadBody(ctx, name)
+		if getErr == nil && bytes.Equal(currentBody, body) {
+			etag, err = currentCursor, nil
 		}
 	}
 	if errors.Is(err, objectstore.ErrPreconditionFailed) {
@@ -394,7 +402,7 @@ func (l *Lease) update(ctx context.Context, mutate func(*State) error) error {
 	if err != nil {
 		return err
 	}
-	etag, err := l.commitState(ctx, body)
+	etag, err := l.commitState(ctx, body, candidate)
 	if errors.Is(err, objectstore.ErrPreconditionFailed) {
 		l.lost = true
 		return ErrLeaseLost
@@ -414,13 +422,13 @@ func (l *Lease) resolvePendingLocked(ctx context.Context) error {
 	if pending == nil {
 		return nil
 	}
-	current, err := l.remote.Store.Get(ctx, StateKey(l.state.Name))
+	currentBody, currentCursor, err := l.remote.readHeadBody(ctx, l.state.Name)
 	if err != nil {
 		return err
 	}
 	l.pending = nil
-	if bytes.Equal(current.Data, pending.body) {
-		pending.commit(current.ETag)
+	if bytes.Equal(currentBody, pending.body) {
+		pending.commit(currentCursor)
 		if pending.manifest != nil {
 			l.adoptedManifest = pending.manifest
 		}
@@ -459,14 +467,14 @@ func sameLogicalManifest(a, b Manifest) bool {
 	return reflect.DeepEqual(a, b)
 }
 
-func (l *Lease) commitState(ctx context.Context, body []byte) (string, error) {
-	etag, err := l.remote.Store.PutIfMatch(ctx, StateKey(l.state.Name), body, l.etag)
+func (l *Lease) commitState(ctx context.Context, body []byte, candidate State) (string, error) {
+	etag, err := l.remote.head().commit(ctx, l.state.Name, body, l.etag, candidate)
 	if err == nil {
 		return etag, nil
 	}
-	current, getErr := l.remote.Store.Get(ctx, StateKey(l.state.Name))
-	if getErr == nil && bytes.Equal(current.Data, body) {
-		return current.ETag, nil
+	currentBody, currentCursor, getErr := l.remote.readHeadBody(ctx, l.state.Name)
+	if getErr == nil && bytes.Equal(currentBody, body) {
+		return currentCursor, nil
 	}
 	return "", err
 }
@@ -1038,7 +1046,7 @@ func (l *Lease) commitManifest(
 	if err != nil {
 		return err
 	}
-	etag, err := l.commitState(ctx, stateBody)
+	etag, err := l.commitState(ctx, stateBody, candidate)
 	if errors.Is(err, objectstore.ErrPreconditionFailed) {
 		l.lost = true
 		return ErrLeaseLost
@@ -1170,11 +1178,12 @@ func (r *Remote) Break(ctx context.Context, name, expectedToken string) error {
 		return fmt.Errorf("lease holder changed while awaiting confirmation: %w", ErrLeaseLost)
 	}
 	state.Lease = nil
+	state.Epoch++
 	body, err := json.Marshal(state)
 	if err != nil {
 		return err
 	}
-	_, err = r.Store.PutIfMatch(ctx, StateKey(name), body, etag)
+	_, err = r.head().commit(ctx, name, body, etag, state)
 	if errors.Is(err, objectstore.ErrPreconditionFailed) {
 		return fmt.Errorf("lease changed while breaking it: %w", ErrLeaseLost)
 	}
@@ -1939,24 +1948,38 @@ func (r *Remote) List(ctx context.Context) ([]State, error) {
 		return nil, err
 	}
 	states := make([]State, 0)
+	seen := make(map[string]struct{})
 	for _, key := range keys {
-		if len(key) < len("/state.json") || key[len(key)-len("/state.json"):] != "/state.json" {
+		name, ok := headVolumeName(key)
+		if !ok {
 			continue
 		}
-		obj, err := r.Store.Get(ctx, key)
+		if _, done := seen[name]; done {
+			continue
+		}
+		seen[name] = struct{}{}
+		state, _, err := r.Inspect(ctx, name)
+		if errors.Is(err, objectstore.ErrNotFound) {
+			continue
+		}
 		if err != nil {
-			return nil, err
-		}
-		var state State
-		if err := json.Unmarshal(obj.Data, &state); err != nil {
-			return nil, err
-		}
-		if err := validateState(state.Name, state); err != nil {
 			return nil, err
 		}
 		states = append(states, state)
 	}
 	return states, nil
+}
+
+func headVolumeName(key string) (string, bool) {
+	rest, ok := strings.CutPrefix(key, "volumes/")
+	if !ok {
+		return "", false
+	}
+	name, tail, ok := strings.Cut(rest, "/")
+	if !ok || !validVolumeName.MatchString(name) {
+		return "", false
+	}
+	return name, tail == "state.json" || strings.HasPrefix(tail, "heads/")
 }
 
 func (r *Remote) Delete(ctx context.Context, name string) error {
@@ -1969,13 +1992,14 @@ func (r *Remote) Delete(ctx context.Context, name string) error {
 	}
 	state.Deleting = true
 	state.Lease = nil
+	state.Epoch++
 	body, err := json.Marshal(state)
 	if err != nil {
 		return err
 	}
-	if _, err := r.Store.PutIfMatch(ctx, StateKey(name), body, etag); err != nil {
-		current, getErr := r.Store.Get(ctx, StateKey(name))
-		if getErr != nil || !bytes.Equal(current.Data, body) {
+	if _, err := r.head().commit(ctx, name, body, etag, state); err != nil {
+		currentBody, _, getErr := r.readHeadBody(ctx, name)
+		if getErr != nil || !bytes.Equal(currentBody, body) {
 			return err
 		}
 	}
@@ -1984,14 +2008,14 @@ func (r *Remote) Delete(ctx context.Context, name string) error {
 		return err
 	}
 	for _, key := range keys {
-		if key == StateKey(name) {
+		if r.head().owns(name, key) {
 			continue
 		}
 		if err := r.Store.Delete(ctx, key); err != nil {
 			return err
 		}
 	}
-	return r.Store.Delete(ctx, StateKey(name))
+	return r.head().remove(ctx, name)
 }
 
 func (r *Remote) DeleteFamily(ctx context.Context, base string) error {

@@ -17,9 +17,9 @@ Each mounted volume is an ext4 filesystem on a Linux NBD device. Satchel writes 
 1. Seals the current generation.
 2. Compresses changed blocks into bounded segments.
 3. Uploads any segment too large to keep inline.
-4. Advances `state.json` with a conditional S3 write that includes the new manifest when it fits within the bounded inline area.
+4. Advances the volume head with a conditional S3 write that includes the new manifest when it fits within the bounded inline area.
 
-The volume lease and published generation live in the same state object. A stale writer may upload unused objects, but it cannot advance the volume head after another node takes the lease.
+The volume lease and published generation live in the same state object. A stale writer may upload unused objects, but it cannot advance the volume head after another node takes the lease. Backends that lack conditional writes, such as Garage, use `--s3-head=append`, which keeps the head as an append-only version log instead of one `If-Match` object. See [docs/format.md](docs/format.md#append-head) for the tradeoffs.
 
 Satchel starts packing inline history into immutable manifest bundles at 16 KiB, with a 64 KiB hard limit. The state keeps one pointer to the newest bundle, and bundles link to older bundles. This keeps the mutable object bounded without adding a second S3 request to every small commit.
 
@@ -31,7 +31,7 @@ See [docs/format.md](docs/format.md) for the on-bucket format and failure rules.
 
 - Linux with the `nbd` kernel module
 - `mkfs.ext4` and `mount`
-- An S3-compatible bucket with working `If-Match` and `If-None-Match` writes
+- An S3-compatible bucket with working `If-Match` and `If-None-Match` writes, or a bucket on a backend without them (Garage) run with `--s3-head=append`
 
 Load enough NBD devices for the number of volumes that may be mounted on a node:
 
@@ -117,6 +117,7 @@ satchel vol rm app-data
 | `--s3-bucket` | `SATCHEL_S3_BUCKET` | required |
 | `--s3-access-key` | `SATCHEL_S3_ACCESS_KEY` | `AWS_ACCESS_KEY_ID` |
 | `--s3-secret-key` | `SATCHEL_S3_SECRET_KEY` | `AWS_SECRET_ACCESS_KEY` |
+| `--s3-head` | `SATCHEL_S3_HEAD` | `conditional` |
 | `--lease-ttl` | `SATCHEL_LEASE_TTL` | `30s` |
 | `--sync-interval` | `SATCHEL_SYNC_INTERVAL` | `5s` |
 | `--dirty-limit` | `SATCHEL_DIRTY_LIMIT` | `256MiB` |

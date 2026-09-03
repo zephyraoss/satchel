@@ -209,6 +209,7 @@ func TestUnmountDoesNotRunGarbageCollection(t *testing.T) {
 	if _, err := driver.Mount(&volume.MountRequest{Name: "data", ID: "container"}); err != nil {
 		t.Fatal(err)
 	}
+	store.lists.Store(0)
 	if err := driver.Unmount(&volume.UnmountRequest{Name: "data", ID: "container"}); err != nil {
 		t.Fatal(err)
 	}

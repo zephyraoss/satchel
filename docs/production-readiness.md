@@ -218,6 +218,12 @@ e2e now quiesces the holder's trailing checkpoint before breaking, matching the
 documented operator procedure). A fault campaign and a remote-durability
 pgbench comparison (same host, MinIO vs R2) run with the fixed binary.
 
+- Garage (v2.2.0) covered 2026-09-03: it accepts and ignores `If-Match` and
+  `If-None-Match`, so the conditional probe correctly refuses it. The new
+  append head (`--s3-head=append`, `internal/replica/head.go`) publishes the
+  state document as an append-only version log with a settle-window takeover
+  and a list-after-write fence; the full e2e suite runs against a local Garage
+  with `SATCHEL_E2E_S3_HEAD=append`.
 - Still to run: real AWS S3 (same region as compute) with the same battery, to
   shake out a third implementation's conditional-write and latency behavior.
 - Confirm `If-Match`/`If-None-Match` behave identically — the fence depends on

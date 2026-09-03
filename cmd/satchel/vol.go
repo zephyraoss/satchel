@@ -16,10 +16,15 @@ import (
 	"github.com/zephyraoss/satchel/internal/replica"
 )
 
+type volOptions struct {
+	s3   objectstore.S3Config
+	head string
+}
+
 func newVolCommand() *cobra.Command {
-	opts := objectstore.S3Config{}
+	opts := volOptions{}
 	cmd := &cobra.Command{Use: "vol", Short: "Inspect and manage remote volumes"}
-	bindS3Flags(cmd, &opts)
+	bindS3Flags(cmd, &opts.s3, &opts.head)
 	cmd.PersistentFlags().AddFlagSet(cmd.Flags())
 	cmd.AddCommand(
 		newVolListCommand(&opts),
@@ -33,7 +38,7 @@ func newVolCommand() *cobra.Command {
 	return cmd
 }
 
-func newVolGCCommand(opts *objectstore.S3Config) *cobra.Command {
+func newVolGCCommand(opts *volOptions) *cobra.Command {
 	var historyRetention time.Duration
 	var gracePeriod time.Duration
 	cmd := &cobra.Command{
@@ -76,14 +81,18 @@ func newVolGCCommand(opts *objectstore.S3Config) *cobra.Command {
 	return cmd
 }
 
-func buildRemote(opts objectstore.S3Config) (*replica.Remote, error) {
-	if opts.Bucket == "" {
+func buildRemote(opts volOptions) (*replica.Remote, error) {
+	if opts.s3.Bucket == "" {
 		return nil, errors.New("--s3-bucket (SATCHEL_S3_BUCKET) is required")
 	}
-	return &replica.Remote{Store: objectstore.NewS3(opts)}, nil
+	head, err := replica.ParseHeadMode(opts.head)
+	if err != nil {
+		return nil, fmt.Errorf("--s3-head: %w", err)
+	}
+	return &replica.Remote{Store: objectstore.NewS3(opts.s3), Head: head}, nil
 }
 
-func newVolListCommand(opts *objectstore.S3Config) *cobra.Command {
+func newVolListCommand(opts *volOptions) *cobra.Command {
 	return &cobra.Command{
 		Use:   "ls",
 		Short: "List volumes in the bucket",
@@ -110,7 +119,7 @@ func newVolListCommand(opts *objectstore.S3Config) *cobra.Command {
 	}
 }
 
-func newVolInspectCommand(opts *objectstore.S3Config) *cobra.Command {
+func newVolInspectCommand(opts *volOptions) *cobra.Command {
 	return &cobra.Command{
 		Use:   "inspect <volume>",
 		Short: "Print volume metadata",
@@ -133,7 +142,7 @@ func newVolInspectCommand(opts *objectstore.S3Config) *cobra.Command {
 	}
 }
 
-func newVolVerifyCommand(opts *objectstore.S3Config) *cobra.Command {
+func newVolVerifyCommand(opts *volOptions) *cobra.Command {
 	var deep bool
 	cmd := &cobra.Command{
 		Use:   "verify <volume>",
@@ -171,7 +180,7 @@ func newVolVerifyCommand(opts *objectstore.S3Config) *cobra.Command {
 	return cmd
 }
 
-func newVolRestoreCommand(opts *objectstore.S3Config) *cobra.Command {
+func newVolRestoreCommand(opts *volOptions) *cobra.Command {
 	var generation uint64
 	var timestamp string
 	cmd := &cobra.Command{
@@ -209,7 +218,7 @@ func newVolRestoreCommand(opts *objectstore.S3Config) *cobra.Command {
 	return cmd
 }
 
-func newVolRemoveCommand(opts *objectstore.S3Config) *cobra.Command {
+func newVolRemoveCommand(opts *volOptions) *cobra.Command {
 	return &cobra.Command{
 		Use:   "rm <volume>",
 		Short: "Delete an unmounted volume and its objects",
@@ -224,7 +233,7 @@ func newVolRemoveCommand(opts *objectstore.S3Config) *cobra.Command {
 	}
 }
 
-func newVolLeaseCommand(opts *objectstore.S3Config) *cobra.Command {
+func newVolLeaseCommand(opts *volOptions) *cobra.Command {
 	lease := &cobra.Command{Use: "lease", Short: "Inspect or break a volume lease"}
 	var yes bool
 	breakCommand := &cobra.Command{
