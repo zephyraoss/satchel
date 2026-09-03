@@ -2034,6 +2034,9 @@ func (r *Remote) List(ctx context.Context) ([]State, error) {
 			continue
 		}
 		seen[name] = struct{}{}
+		if r.HeadMode() == ConditionalHead && strings.HasPrefix(key, HeadPrefix(name)) {
+			return nil, foreignHeadError(name, AppendHead)
+		}
 		state, _, err := r.Inspect(ctx, name)
 		if errors.Is(err, objectstore.ErrNotFound) {
 			continue

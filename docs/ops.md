@@ -18,7 +18,7 @@ Garage does not implement conditional writes and its maintainers consider them o
 
 ### Append head takeover
 
-With the append head, lease takeover writes a claim version, waits for the settle window (three seconds by default), lists the head prefix, and proceeds only if no other node claimed a newer epoch in the meantime. Two nodes racing for an expired lease both back off when they see each other, then retry. A claim that took longer than half the settle window to reach the bucket is discarded rather than trusted. A stale writer is fenced by its next state write: every write lists the prefix afterwards and fails with lease loss when a newer epoch exists. That check costs one LIST per publish, so commit latency on Garage is one PUT plus one LIST rather than one conditional PUT.
+With the append head, lease takeover writes a claim version, waits for the settle window (three seconds by default), lists the head prefix, and proceeds only if no other node claimed a newer epoch in the meantime. Two nodes racing for an expired lease each write a claim and wait out the settle window; exactly one proceeds, and the other's mount fails with a lease-lost error rather than retrying on its own. A claim that took longer than half the settle window to reach the bucket is discarded rather than trusted. A stale writer is fenced by its next state write: every write lists the prefix afterwards and fails with lease loss when a newer epoch exists. That check costs one LIST per publish, so commit latency on Garage is one PUT plus one LIST rather than one conditional PUT.
 
 ## Lease recovery
 

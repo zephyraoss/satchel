@@ -28,7 +28,7 @@ A generation object created with `If-None-Match: *` cannot replace this conditio
 Some backends, notably Garage, accept `If-Match` and `If-None-Match` headers but ignore them. `--s3-head=append` keeps the same state document but publishes it as an append-only log of immutable versions under `heads/`:
 
 ```text
-heads/<inverted epoch>_<claim ms>_<lease token>_<inverted seq>.json
+heads/<inverted epoch>_<lease token>_<inverted seq>_<claim ms>.json
 ```
 
 The epoch and sequence fields are zero-padded and inverted, so a plain sorted listing puts the newest version first. Every version is written with an unconditional PUT to a key that no other writer will ever use, so writers never overwrite each other; they only ever disagree about which key is the head. The head of a volume is the first listed version with a non-zero sequence.
