@@ -12,6 +12,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"golang.org/x/sys/unix"
 )
 
 type Fetcher func(ctx context.Context, bucket, key string) (io.ReadCloser, error)
@@ -24,13 +26,18 @@ func (s *Seeder) Apply(ctx context.Context, destination, source string) (int64, 
 	if strings.HasPrefix(source, "s3://") {
 		return s.applyS3(ctx, destination, source)
 	}
-	info, err := os.Stat(source)
+	resolved, err := filepath.EvalSymlinks(source)
+	if err != nil {
+		return 0, err
+	}
+	info, err := os.Stat(resolved)
 	if err != nil {
 		return 0, err
 	}
 	if info.IsDir() {
-		return importDir(ctx, destination, source)
+		return importDir(ctx, destination, resolved)
 	}
+	source = resolved
 	file, err := os.Open(source)
 	if err != nil {
 		return 0, err
@@ -110,13 +117,14 @@ func importArchive(ctx context.Context, destination string, reader io.Reader, co
 	}
 	archive := tar.NewReader(reader)
 	var count int64
+	var directories []*tar.Header
 	for {
 		if err := ctx.Err(); err != nil {
 			return count, err
 		}
 		header, err := archive.Next()
 		if errors.Is(err, io.EOF) {
-			return count, nil
+			break
 		}
 		if err != nil {
 			return count, err
@@ -124,6 +132,9 @@ func importArchive(ctx context.Context, destination string, reader io.Reader, co
 		target, err := safePath(destination, header.Name)
 		if err != nil {
 			return count, fmt.Errorf("tar entry %q: %w", header.Name, err)
+		}
+		if target == destination {
+			continue
 		}
 		if err := ensureSafeParents(destination, filepath.Dir(target)); err != nil {
 			return count, fmt.Errorf("tar entry %q: %w", header.Name, err)
@@ -141,12 +152,26 @@ func importArchive(ctx context.Context, destination string, reader io.Reader, co
 		if err != nil {
 			return count, fmt.Errorf("tar entry %q: %w", header.Name, err)
 		}
-		if header.Typeflag != tar.TypeSymlink {
-			_ = os.Chtimes(target, header.AccessTime, header.ModTime)
-			_ = os.Chown(target, header.Uid, header.Gid)
+		switch header.Typeflag {
+		case tar.TypeDir:
+			directories = append(directories, header)
+		case tar.TypeSymlink:
+		default:
+			applyMetadata(target, header)
 		}
 		count++
 	}
+	for index := len(directories) - 1; index >= 0; index-- {
+		header := directories[index]
+		target, _ := safePath(destination, header.Name)
+		applyMetadata(target, header)
+	}
+	return count, nil
+}
+
+func applyMetadata(target string, header *tar.Header) {
+	_ = os.Chown(target, header.Uid, header.Gid)
+	_ = os.Chtimes(target, header.AccessTime, header.ModTime)
 }
 
 func safePath(root, name string) (string, error) {
@@ -201,7 +226,12 @@ func copyFile(source, destination string, mode os.FileMode) error {
 }
 
 func writeFile(reader io.Reader, destination string, mode os.FileMode) error {
-	out, err := os.OpenFile(destination, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
+	if info, err := os.Lstat(destination); err == nil && !info.Mode().IsRegular() {
+		return fmt.Errorf("refusing to write through %s: not a regular file", destination)
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	out, err := os.OpenFile(destination, os.O_CREATE|os.O_WRONLY|os.O_TRUNC|unix.O_NOFOLLOW, mode)
 	if err != nil {
 		return err
 	}
