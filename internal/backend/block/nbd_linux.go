@@ -52,6 +52,7 @@ const (
 	nbdFlagSendWriteZeros = 1 << 6
 
 	maxNBDRequest = 32 << 20
+	writeChunk    = 4 << 20
 )
 
 type Attachment struct {
@@ -357,7 +358,7 @@ func serveNBD(conn net.Conn, device *replica.Device, readOnly bool) error {
 			if readOnly {
 				requestErr = unix.EROFS
 			} else {
-				_, requestErr = device.WriteAt(data, int64(offset))
+				requestErr = writeChunked(device, data, int64(offset))
 			}
 		case nbdCmdTrim, nbdCmdWriteZeroes:
 			if readOnly {
@@ -386,6 +387,18 @@ func serveNBD(conn net.Conn, device *replica.Device, readOnly bool) error {
 			return waitForWorkers(err)
 		}
 	}
+}
+
+func writeChunked(device *replica.Device, data []byte, offset int64) error {
+	for len(data) > 0 {
+		n := min(len(data), writeChunk)
+		if _, err := device.WriteAt(data[:n], offset); err != nil {
+			return err
+		}
+		data = data[n:]
+		offset += int64(n)
+	}
+	return nil
 }
 
 func errno(err error) syscall.Errno {

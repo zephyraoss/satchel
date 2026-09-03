@@ -100,7 +100,6 @@ func (m *Mount) close(ctx context.Context, detach bool) error {
 	if err := unmount(ctx, m.mountpoint, flags); err != nil && !detach {
 		return err
 	}
-	m.closed = true
 	var result error
 	if err := m.attachment.Close(); err != nil {
 		result = err
@@ -108,6 +107,7 @@ func (m *Mount) close(ctx context.Context, detach bool) error {
 	if err := os.Remove(m.mountpoint); err != nil && !errors.Is(err, os.ErrNotExist) && result == nil {
 		result = err
 	}
+	m.closed = result == nil
 	return result
 }
 
