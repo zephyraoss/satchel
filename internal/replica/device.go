@@ -56,6 +56,7 @@ type Device struct {
 	active         map[uint64][]byte
 	onBackpressure func()
 	onDirty        func()
+	onDirtyChange  func(int64)
 	dirtyThreshold int64
 	dirtyNotified  bool
 	onFlush        func() error
@@ -113,6 +114,18 @@ func (d *Device) SetDirtyHandler(threshold int64, handler func()) {
 	d.onDirty = handler
 	d.dirtyNotified = threshold > 0 && d.dirty >= threshold
 	d.mu.Unlock()
+}
+
+func (d *Device) SetDirtyObserver(observer func(bytes int64)) {
+	d.mu.Lock()
+	d.onDirtyChange = observer
+	d.mu.Unlock()
+}
+
+func (d *Device) observeDirtyLocked() {
+	if d.onDirtyChange != nil {
+		d.onDirtyChange(d.dirty)
+	}
 }
 
 // SetFlushHandler sets a function called after the local image reaches stable
@@ -235,6 +248,7 @@ func (d *Device) WriteAt(p []byte, off int64) (int, error) {
 		if d.hydrator != nil {
 			d.hydrator.CommitWrite(off, int64(n))
 		}
+		d.observeDirtyLocked()
 		d.notifyDirtyLocked()
 	}
 	if err != nil {
@@ -290,6 +304,7 @@ func (d *Device) Trim(off, length int64) error {
 	if length > 0 {
 		d.localDirty = true
 	}
+	d.observeDirtyLocked()
 	d.notifyDirtyLocked()
 	return nil
 }
@@ -475,6 +490,7 @@ func (d *Device) Release(g *Generation) {
 	if d.dirty < d.dirtyThreshold {
 		d.dirtyNotified = false
 	}
+	d.observeDirtyLocked()
 	d.ready.Broadcast()
 	d.mu.Unlock()
 	for _, block := range g.Blocks {

@@ -367,6 +367,7 @@ func (d *Driver) mountFresh(ctx context.Context, state *volumeState, mount *moun
 	})
 	releaseOnFailure := func(cause error) error {
 		stopBeat()
+		d.cleanupLocal(mount.name)
 		if err := lease.Release(context.WithoutCancel(ctx)); err != nil {
 			d.log.Error("release lease after failed mount", "volume", mount.name, "err", err)
 		}
@@ -426,7 +427,6 @@ func (d *Driver) mountFresh(ctx context.Context, state *volumeState, mount *moun
 	cleanupMounted := func(cause error) error {
 		_ = unmounter.Abandon()
 		_ = device.Close()
-		d.cleanupLocal(mount.name)
 		mount.active, mount.lease, mount.device, mount.unmounter, mount.syncer, mount.stopBeat = false, nil, nil, nil, nil, nil
 		return releaseOnFailure(cause)
 	}
@@ -462,6 +462,9 @@ func (d *Driver) mountFresh(ctx context.Context, state *volumeState, mount *moun
 	device.SetBackpressureHandler(func() {
 		metrics.BackpressureEvents.WithLabelValues(mount.name).Inc()
 		syncer.Notify()
+	})
+	device.SetDirtyObserver(func(bytes int64) {
+		metrics.UnpublishedBytes.WithLabelValues(mount.name).Set(float64(bytes))
 	})
 	if opts.RemoteDurability() {
 		device.SetRemoteFlushHandler(syncer.EnqueueGeneration)
@@ -556,11 +559,11 @@ func (d *Driver) unmountLast(ctx context.Context, mount *mountState) error {
 	if mount.syncer != nil {
 		started := time.Now()
 		if err := mount.syncer.SyncCheckpoint(ctx); err != nil {
-			return fmt.Errorf("final sync %s: %w", mount.name, err)
+			return d.abandonUnmounted(mount, fmt.Errorf("final sync %s: %w", mount.name, err))
 		}
 		mount.stopBeat()
 		if err := mount.syncer.Stop(ctx); err != nil {
-			return fmt.Errorf("release %s: %w", mount.name, err)
+			return d.abandonUnmounted(mount, fmt.Errorf("release %s: %w", mount.name, err))
 		}
 		metrics.LeaseHeld.WithLabelValues(mount.name).Set(0)
 		metrics.SyncDuration.Observe(time.Since(started).Seconds())
@@ -569,9 +572,34 @@ func (d *Driver) unmountLast(ctx context.Context, mount *mountState) error {
 		return err
 	}
 	metrics.MountedVolumes.Dec()
+	metrics.UnpublishedBytes.DeleteLabelValues(mount.name)
 	d.cleanupLocal(mount.name)
 	mount.active, mount.lease, mount.device, mount.unmounter, mount.syncer, mount.stopBeat = false, nil, nil, nil, nil, nil
 	return nil
+}
+
+func (d *Driver) abandonUnmounted(mount *mountState, cause error) error {
+	d.log.Error("final publication failed after unmount; discarding the local image and releasing the lease", "volume", mount.name, "err", cause)
+	metrics.MountFailures.WithLabelValues("final_sync").Inc()
+	if mount.syncer != nil {
+		mount.syncer.Abandon()
+	}
+	if mount.stopBeat != nil {
+		mount.stopBeat()
+	}
+	if mount.lease != nil {
+		if err := mount.lease.Release(context.Background()); err != nil {
+			d.log.Error("release lease after failed final sync", "volume", mount.name, "err", err)
+		}
+	}
+	metrics.LeaseHeld.WithLabelValues(mount.name).Set(0)
+	if mount.device != nil {
+		_ = mount.device.Close()
+	}
+	metrics.MountedVolumes.Dec()
+	d.cleanupLocal(mount.name)
+	mount.active, mount.lease, mount.device, mount.unmounter, mount.syncer, mount.stopBeat = false, nil, nil, nil, nil, nil
+	return cause
 }
 
 func (d *Driver) cleanupLocal(name string) {

@@ -278,8 +278,9 @@ version with a written upgrade path.
 A backend for irreplaceable data is only as good as the runbook around it.
 
 - **Monitoring thresholds.** Turn the existing metrics into alerts with real
-  numbers: unpublished-bytes approaching the dirty limit, backpressure events,
-  lease-fenced events, replication p99 regression, restore duration.
+  numbers: `satchel_unpublished_bytes` approaching the dirty limit,
+  backpressure events, lease-fenced events, replication p99 regression, restore
+  duration.
 - **Disaster-recovery drills.** Documented, rehearsed procedures for: total node
   loss with takeover, restore-to-point-in-time from PITR history, and recovery
   from a corrupted or partially-deleted bucket.

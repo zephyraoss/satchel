@@ -13,6 +13,10 @@ var (
 		Name: "satchel_mounted_volumes",
 		Help: "Number of volumes currently mounted on this node.",
 	})
+	UnpublishedBytes = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "satchel_unpublished_bytes",
+		Help: "Bytes of changed blocks not yet published to S3, per volume.",
+	}, []string{"volume"})
 	LeaseHeld = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "satchel_lease_held",
 		Help: "1 while this node holds the lease for the volume.",
