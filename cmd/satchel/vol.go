@@ -56,13 +56,18 @@ func newVolGCCommand(opts *volOptions) *cobra.Command {
 				return err
 			}
 			beatCtx, stopBeat := context.WithCancel(cmd.Context())
+			collectCtx, cancelCollect := context.WithCancel(cmd.Context())
+			defer cancelCollect()
 			beatDone := make(chan struct{})
 			var heartbeatErr error
 			go func() {
 				defer close(beatDone)
-				lease.Heartbeat(beatCtx, func(err error) { heartbeatErr = err })
+				lease.Heartbeat(beatCtx, func(err error) {
+					heartbeatErr = err
+					cancelCollect()
+				})
 			}()
-			result, collectErr := lease.CollectGarbage(cmd.Context(), replica.GCOptions{
+			result, collectErr := lease.CollectGarbage(collectCtx, replica.GCOptions{
 				HistoryRetention: historyRetention,
 				GracePeriod:      gracePeriod,
 			})
@@ -205,8 +210,17 @@ func newVolRestoreCommand(opts *volOptions) *cobra.Command {
 				}
 				restoreOpts.Timestamp = parsed
 			}
-			state, err := remote.RestoreWithOptions(cmd.Context(), args[0], args[1], restoreOpts)
+			partial := args[1] + ".partial"
+			if err := os.Remove(partial); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+			state, err := remote.RestoreWithOptions(cmd.Context(), args[0], partial, restoreOpts)
 			if err != nil {
+				_ = os.Remove(partial)
+				return err
+			}
+			if err := os.Rename(partial, args[1]); err != nil {
+				_ = os.Remove(partial)
 				return err
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "restored %s generation %d to %s\n", state.Name, state.Generation, args[1])
@@ -219,18 +233,29 @@ func newVolRestoreCommand(opts *volOptions) *cobra.Command {
 }
 
 func newVolRemoveCommand(opts *volOptions) *cobra.Command {
-	return &cobra.Command{
+	var yes bool
+	cmd := &cobra.Command{
 		Use:   "rm <volume>",
 		Short: "Delete an unmounted volume and its objects",
+		Long:  "Deletes the volume head and every immutable object under it. Read-only mounts hold no lease, so stop them on every node first; this command cannot detect them.",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			remote, err := buildRemote(*opts)
 			if err != nil {
 				return err
 			}
+			if !yes {
+				fmt.Fprintf(cmd.ErrOrStderr(), "This permanently deletes %s and all of its history.\nRead-only mounts are not tracked by a lease; stop them on every node first.\nType the volume name to continue: ", args[0])
+				answer, _ := bufio.NewReader(cmd.InOrStdin()).ReadString('\n')
+				if strings.TrimSpace(answer) != args[0] {
+					return errors.New("confirmation did not match; volume left intact")
+				}
+			}
 			return remote.Delete(cmd.Context(), args[0])
 		},
 	}
+	cmd.Flags().BoolVar(&yes, "yes", false, "skip the confirmation prompt")
+	return cmd
 }
 
 func newVolLeaseCommand(opts *volOptions) *cobra.Command {
