@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -210,18 +211,19 @@ func newVolRestoreCommand(opts *volOptions) *cobra.Command {
 				}
 				restoreOpts.Timestamp = parsed
 			}
-			partial := args[1] + ".partial"
-			if err := os.Remove(partial); err != nil && !errors.Is(err, os.ErrNotExist) {
+			scratch, err := os.CreateTemp(filepath.Dir(args[1]), filepath.Base(args[1])+".partial-*")
+			if err != nil {
 				return err
 			}
+			partial := scratch.Name()
+			scratch.Close()
+			defer os.Remove(partial)
 			state, err := remote.RestoreWithOptions(cmd.Context(), args[0], partial, restoreOpts)
 			if err != nil {
-				_ = os.Remove(partial)
 				return err
 			}
-			if err := os.Rename(partial, args[1]); err != nil {
-				_ = os.Remove(partial)
-				return err
+			if err := os.Link(partial, args[1]); err != nil {
+				return fmt.Errorf("finalize restore: %w", err)
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "restored %s generation %d to %s\n", state.Name, state.Generation, args[1])
 			return nil
