@@ -37,8 +37,7 @@ func (s *Seeder) Apply(ctx context.Context, destination, source string) (int64, 
 	if info.IsDir() {
 		return importDir(ctx, destination, resolved)
 	}
-	source = resolved
-	file, err := os.Open(source)
+	file, err := os.Open(resolved)
 	if err != nil {
 		return 0, err
 	}
