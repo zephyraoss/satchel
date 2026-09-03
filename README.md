@@ -1,22 +1,52 @@
-# satchel
+# Satchel Block
 
-`satchel` allows for portable docker volumes for simple Docker clusters (built for [uncloud](https://github.com/psviderski/uncloud)). A satchel volume will follow your service from node to node allowing simple migrations of apps between nodes.
+Satchel Block provides portable Docker volumes for small clusters. A volume uses a local ext4 filesystem while mounted and replicates changed blocks to an S3-compatible bucket. When a writable service moves to another node, Satchel creates a sparse image and fetches its blocks from S3 as the filesystem reads them.
 
-`satchel` volumes are stored in SQLite databases. While a volume is mounted, [Litestream](https://litestream.io) will replicate it to a remote (for example, an S3 bucket). When a service lands on another node, satchel restores from the remote before the container starts. A lease object in the same bucket guarantees that only one node can have a volume mounted at a time.
+Satchel permits one writer per volume. It is not a shared filesystem.
 
-## Read this before using it
+## Status
 
-**This is not a shared volume.** satchel does not support multiple writers. If a second node tries to mount a volume that is already mounted, the mount fails with `volume X is held by node Y`. If you need to scale past one replica, you either need to set your volume as read-only or use `scope=replica` to give each scaled container its own volume.
+The block format is new and not compatible with the former SQLite and Litestream format. There is no migration path because the old format had no production users.
 
-**Not for databases / heavy workloads.** Postgres, MySQL and other heavy workloads will likely run poorly via satchel. satchel is built for configuration, application state, uploads, caches, and small working sets.
+By default, `fsync` and FUA writes wait until Satchel publishes the current generation to S3. A database can therefore treat a successful `fsync` as durable across node loss. `durability=async` treats `fsync` as an ordering barrier and does not sync the local image or wait for S3. If only the application or PostgreSQL process crashes, the still-running Satchel mount retains its writes. A Satchel process crash, forced restart, or host failure can lose every generation that has not reached S3. Clean Satchel shutdown publishes queued changes. The sync interval defaults to five seconds.
+
+## How it works
+
+Each mounted volume is an ext4 filesystem on a Linux NBD device. Satchel writes through to a sparse local image and records complete 4 KiB blocks in the current generation. At each sync interval, and on every filesystem flush in remote durability mode, Satchel:
+
+1. Seals the current generation.
+2. Compresses changed blocks into bounded segments.
+3. Uploads any segment too large to keep inline.
+4. Advances the volume head with a conditional S3 write that includes the new manifest when it fits within the bounded inline area.
+
+The volume lease and published generation live in the same state object. A stale writer may upload unused objects, but it cannot advance the volume head after another node takes the lease. Backends that lack conditional writes, such as Garage, use `--s3-head=append`, which keeps the head as an append-only version log instead of one `If-Match` object. See [docs/format.md](docs/format.md#append-head) for the tradeoffs.
+
+Satchel starts packing inline history into immutable manifest bundles at 16 KiB, with a 64 KiB hard limit. The state keeps one pointer to the newest bundle, and bundles link to older bundles. This keeps the mutable object bounded without adding a second S3 request to every small commit.
+
+Satchel compacts the manifest chain after 128 generations. A checkpoint reuses existing immutable segments and records only the newest non-zero source for each block range. It does not scan or re-upload the image. Satchel acknowledges the flush that triggered it as soon as the delta is durable, then compacts the chain in the replication worker. Current restores stop at that checkpoint, while its parent link keeps older generations available for point-in-time recovery. The default history window is seven days. Garbage collection marks older objects first, waits 24 hours, then deletes anything that is still outside the retained history.
+
+See [docs/format.md](docs/format.md) for the on-bucket format and failure rules.
+
+## Requirements
+
+- Linux with the `nbd` kernel module
+- `mkfs.ext4` and `mount`
+- An S3-compatible bucket with working `If-Match` and `If-None-Match` writes, or a bucket on a backend without them (Garage) run with `--s3-head=append`
+
+Load enough NBD devices for the number of volumes that may be mounted on a node:
+
+```sh
+sudo modprobe nbd nbds_max=64
+```
 
 ## Install
 
-You need Litestream ≥ 0.5 on the node (or use the managed plugin image, which bundles it) and an S3 bucket on a storage node reachable by every Docker host.
+### Managed Docker plugin
 
-### Managed plugin
+Load the NBD module before installing the plugin. The bundled plugin manifest exposes `/dev/nbd0` through `/dev/nbd15`, so the managed plugin supports 16 simultaneous mounts per node.
 
 ```sh
+sudo modprobe nbd nbds_max=16
 ./deploy/plugin/build.sh
 docker plugin set zephyraoss/satchel:dev \
   SATCHEL_S3_ENDPOINT=http://storage-node:9000 \
@@ -27,97 +57,84 @@ docker plugin enable zephyraoss/satchel:dev
 
 ### systemd
 
+Install `e2fsprogs`, load `nbd`, then:
+
 ```sh
 go build -o /usr/local/bin/satchel ./cmd/satchel
-install -d /etc/satchel && cp deploy/systemd/satchel.env.example /etc/satchel/satchel.env   # edit it
+install -d /etc/satchel
+cp deploy/systemd/satchel.env.example /etc/satchel/satchel.env
 cp deploy/systemd/satchel.service /etc/systemd/system/
 systemctl enable --now satchel
 ```
 
-The plugin listens on `/run/docker/plugins/satchel.sock`; Docker discovers it on the next volume operation.
-
 ## Use
 
 ```sh
-docker volume create --driver satchel app-data
-docker run -v app-data:/data alpine sh -c 'echo hello > /data/hi'
-# redeploy anywhere in the cluster
-docker run -v app-data:/data alpine cat /data/hi
+docker volume create --driver satchel -o size=10GiB app-data
+docker run --rm -v app-data:/data alpine sh -c 'echo hello > /data/hi'
+docker run --rm -v app-data:/data alpine cat /data/hi
 ```
 
-With uncloud, reference the volume with `driver: satchel` in your compose file; `uc deploy` moves the service, satchel moves the data.
+With uncloud, use `driver: satchel` in the Compose volume definition.
 
 ### Volume options
 
-```sh
-docker volume create --driver satchel -o mode=ro shared-config     # read-only copy, no lease, safe to mount on N nodes
-docker volume create --driver satchel -o scope=replica cache        # each container gets its own volume
-docker volume create --driver satchel -o seed=/srv/defaults app     # first mount of an empty volume imports this dir
-docker volume create --driver satchel -o seed=s3://bkt/app.tgz app  # ...or a tar / tar.gz from any bucket your creds can read
-docker volume create --driver satchel -o sync_interval=1s hot       # per-volume Litestream sync interval
-```
-
 | option | values | effect |
 |---|---|---|
-| `mode` | `rw` (default), `ro` | `ro` restores the latest state, mounts read-only (`EROFS` on writes), takes no lease and runs no replication. Many nodes can mount it at once. The copy is as of mount time; remount to refresh. |
-| `scope` | `volume` (default), `replica` | `replica` gives each mount request its own volume named `<name>.r-<hash of mount id>`, so a scaled service never trips over the lease. The data is tied to that container; a redeployed container starts a new one. Old ones stay in the bucket until you remove them with `satchel vol` or `docker volume rm`. |
-| `seed` | local dir, `.tar`/`.tgz` file, `s3://bucket/key.tgz` | Imported once, when the volume is mounted for the first time and the bucket has nothing for it. Never re-applied. |
-| `sync_interval` | duration | Overrides `--sync-interval` for this volume. |
-| `class` | `fuse` | Reserved for a future block backend. |
+| `size` | byte count or `KiB`, `MiB`, `GiB` | Virtual volume size. Default `10GiB`, minimum `64MiB`. |
+| `mode` | `rw`, `ro` | Read-only mounts restore a fixed snapshot and do not take a lease. |
+| `scope` | `volume`, `replica` | Replica scope derives a separate volume name from each Docker mount ID. |
+| `durability` | `remote`, `async` | `remote` makes `fsync` wait for S3 and is the default. `async` acknowledges flushes without local or remote stable storage and publishes in the background. |
+| `seed` | directory, `.tar`, `.tgz`, or `s3://` URL | Copies initial files into a newly formatted volume. |
+| `sync_interval` | Go duration | Overrides the five-second generation interval. |
+| `filesystem` | `ext4` | Filesystem written into the block image. |
 
-### Operator CLI
+Volume size and filesystem cannot change after the first mount.
 
-`satchel vol` needs only the S3 credentials and a `litestream` binary; it restores a private snapshot into a temp dir and works on that.
+### Operator commands
 
 ```sh
-satchel vol ls                                  # volumes in the bucket, lease holder, expiry
-satchel vol ls-files -r app                      # mode, size, owner, mtime, path
-satchel vol cat app config/app.yml
-satchel vol put app ./local.yml config/app.yml   # or `-` for stdin
-satchel vol edit app config/app.yml              # $EDITOR; holds the lease while you edit
-satchel vol sql app "select count(*) from inodes"
-satchel vol sql --write app "delete from xattrs"
-satchel vol restore app ./dump --timestamp 2026-08-21T10:00:00Z
-satchel vol lease status app
-satchel vol lease break app                      # asks you to type the holder's name
+satchel vol ls
+satchel vol inspect app-data
+satchel vol restore app-data ./app-data.img
+satchel vol restore app-data ./before.img --timestamp 2026-08-31T12:00:00Z
+satchel vol restore app-data ./generation-42.img --generation 42
+satchel vol gc app-data
+satchel vol lease status app-data
+satchel vol lease break app-data
+satchel vol rm app-data
 ```
 
-Reads work any time. Writes (`put`, `edit`, `sql --write`) take the lease first and fail with `volume X is held by node Y` if a node has it mounted. A successful write is a normal Litestream transaction on the same lineage, so the next mount anywhere sees it.
-
-## How the lease works
-
-`s3://<bucket>/leases/<vol>.json` holds `{holder, token, expires_at, mounted_at}`. Mount acquires it with a conditional PUT (`If-None-Match: *` for a fresh key, `If-Match: <etag>` to take over an expired one) and then heartbeats every `ttl/3` (default TTL 30s). If the heartbeat fails three times in a row, or discovers that someone else now holds the lease, the node fences itself: the mount is abandoned, nothing is replicated, and the volume is marked `fenced` until all containers using it have unmounted. Unmount packs, syncs, and then deletes the lease only if the token still matches.
-
-An operator can break a stuck lease by deleting the object (a `satchel vol lease break` command arrives in v2). Do this only when you are certain the holder is dead.
+`restore` writes a sparse block image. Mount it with a loop device if you need to inspect its files.
 
 ## Configuration
 
-Every flag has an env-var twin; see `satchel plugin --help`.
-
-| flag | env | default |
+| flag | environment variable | default |
 |---|---|---|
 | `--node-id` | `SATCHEL_NODE_ID` | hostname |
 | `--state-dir` | `SATCHEL_STATE_DIR` | `/var/lib/satchel` |
-| `--s3-endpoint` | `SATCHEL_S3_ENDPOINT` | (AWS) |
+| `--s3-endpoint` | `SATCHEL_S3_ENDPOINT` | AWS S3 |
 | `--s3-bucket` | `SATCHEL_S3_BUCKET` | required |
-| `--s3-access-key` / `--s3-secret-key` | `SATCHEL_S3_ACCESS_KEY` / `SATCHEL_S3_SECRET_KEY` | `AWS_*` |
+| `--s3-access-key` | `SATCHEL_S3_ACCESS_KEY` | `AWS_ACCESS_KEY_ID` |
+| `--s3-secret-key` | `SATCHEL_S3_SECRET_KEY` | `AWS_SECRET_ACCESS_KEY` |
 | `--s3-path-style` | `SATCHEL_S3_PATH_STYLE` | `true` |
+| `--s3-head` | `SATCHEL_S3_HEAD` | `conditional` |
 | `--lease-ttl` | `SATCHEL_LEASE_TTL` | `30s` |
 | `--sync-interval` | `SATCHEL_SYNC_INTERVAL` | `5s` |
-| `--backend` | `SATCHEL_BACKEND` | `fuse` |
-| `--wal-limit` | `SATCHEL_WAL_LIMIT` | `256MiB` |
+| `--dirty-limit` | `SATCHEL_DIRTY_LIMIT` | `256MiB` |
+| `--checkpoint-interval` | `SATCHEL_CHECKPOINT_INTERVAL` | `128` |
+| `--history-retention` | `SATCHEL_HISTORY_RETENTION` | `168h` |
+| `--gc-grace` | `SATCHEL_GC_GRACE` | `24h` |
 | `--metrics-addr` | `SATCHEL_METRICS_ADDR` | disabled |
-| `--litestream` | `SATCHEL_LITESTREAM_BIN` | `litestream` |
 
 ## Development
 
 ```sh
-go test ./...            # unit tests; FUSE tests need /dev/fuse and skip otherwise
-./test/e2e/run.sh        # two simulated nodes against MinIO + real litestream (needs docker, litestream on PATH)
-./test/bench/run.sh      # fio against a live mount with replication running (needs fio, MinIO)
-go test ./internal/backend/fuse/ -bench . -run xxx
+go test ./...
+sudo modprobe nbd nbds_max=16
+./test/e2e/run.sh
+./test/bench/run.sh
+./test/bench/postgres.sh remote
 ```
 
-Without Docker, point the e2e suite at any MinIO: `SATCHEL_E2E_S3_ENDPOINT=http://127.0.0.1:9000 go test ./test/e2e/`.
-
-See `docs/` for workload guidance and the roadmap.
+Unit tests do not require NBD, root, or S3. The end-to-end test needs all three.

@@ -7,12 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/url"
 	"os"
-	"path"
+	"path/filepath"
 	"strings"
 
-	"github.com/zephyraoss/satchel/internal/store"
+	"golang.org/x/sys/unix"
 )
 
 type Fetcher func(ctx context.Context, bucket, key string) (io.ReadCloser, error)
@@ -21,121 +22,219 @@ type Seeder struct {
 	Fetch Fetcher
 }
 
-func (s *Seeder) Apply(ctx context.Context, db *store.DB, source string) (int64, error) {
+func (s *Seeder) Apply(ctx context.Context, destination, source string) (int64, error) {
 	if strings.HasPrefix(source, "s3://") {
-		return s.applyS3(ctx, db, source)
+		return s.applyS3(ctx, destination, source)
 	}
-	info, err := os.Stat(source)
+	resolved, err := filepath.EvalSymlinks(source)
+	if err != nil {
+		return 0, err
+	}
+	info, err := os.Stat(resolved)
 	if err != nil {
 		return 0, err
 	}
 	if info.IsDir() {
-		return importDir(ctx, db, source)
+		return importDir(ctx, destination, resolved)
 	}
-	f, err := os.Open(source)
+	file, err := os.Open(resolved)
 	if err != nil {
 		return 0, err
 	}
-	defer f.Close()
-	return importArchive(ctx, db, f, strings.HasSuffix(source, ".gz") || strings.HasSuffix(source, ".tgz"))
+	defer file.Close()
+	return importArchive(ctx, destination, file, strings.HasSuffix(source, ".gz") || strings.HasSuffix(source, ".tgz"))
 }
 
-func (s *Seeder) applyS3(ctx context.Context, db *store.DB, source string) (int64, error) {
+func (s *Seeder) applyS3(ctx context.Context, destination, source string) (int64, error) {
 	if s.Fetch == nil {
 		return 0, errors.New("no S3 fetcher configured")
 	}
-	u, err := url.Parse(source)
+	location, err := url.Parse(source)
 	if err != nil {
 		return 0, err
 	}
-	key := strings.TrimPrefix(u.Path, "/")
-	body, err := s.Fetch(ctx, u.Host, key)
+	key := strings.TrimPrefix(location.Path, "/")
+	body, err := s.Fetch(ctx, location.Host, key)
 	if err != nil {
 		return 0, err
 	}
 	defer body.Close()
-	return importArchive(ctx, db, body, strings.HasSuffix(key, ".gz") || strings.HasSuffix(key, ".tgz"))
+	return importArchive(ctx, destination, body, strings.HasSuffix(key, ".gz") || strings.HasSuffix(key, ".tgz"))
 }
 
-func importDir(ctx context.Context, db *store.DB, dir string) (int64, error) {
+func importDir(ctx context.Context, destination, source string) (int64, error) {
 	var count int64
-	err := db.Do(ctx, func(tx *store.Tx) error {
-		n, err := tx.ImportTree(dir)
-		count = n
+	err := filepath.WalkDir(source, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(source, path)
+		if err != nil || rel == "." {
+			return err
+		}
+		target, err := safePath(destination, filepath.ToSlash(rel))
+		if err != nil {
+			return err
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		switch {
+		case entry.IsDir():
+			err = os.MkdirAll(target, info.Mode().Perm())
+		case entry.Type()&os.ModeSymlink != 0:
+			var link string
+			link, err = os.Readlink(path)
+			if err == nil {
+				err = os.Symlink(link, target)
+			}
+		case info.Mode().IsRegular():
+			err = copyFile(path, target, info.Mode().Perm())
+		default:
+			return nil
+		}
+		if err == nil {
+			count++
+		}
 		return err
 	})
 	return count, err
 }
 
-func importArchive(ctx context.Context, db *store.DB, r io.Reader, gzipped bool) (int64, error) {
-	if gzipped {
-		gz, err := gzip.NewReader(r)
+func importArchive(ctx context.Context, destination string, reader io.Reader, compressed bool) (int64, error) {
+	if compressed {
+		gz, err := gzip.NewReader(reader)
 		if err != nil {
 			return 0, err
 		}
 		defer gz.Close()
-		r = gz
+		reader = gz
 	}
-	tr := tar.NewReader(r)
+	archive := tar.NewReader(reader)
 	var count int64
-	err := db.Do(ctx, func(tx *store.Tx) error {
-		for {
-			hdr, err := tr.Next()
-			if errors.Is(err, io.EOF) {
-				return nil
-			}
-			if err != nil {
-				return err
-			}
-			if err := importTarEntry(tx, tr, hdr); err != nil {
-				return fmt.Errorf("tar entry %q: %w", hdr.Name, err)
-			}
-			count++
+	var directories []*tar.Header
+	for {
+		if err := ctx.Err(); err != nil {
+			return count, err
 		}
-	})
-	return count, err
+		header, err := archive.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return count, err
+		}
+		target, err := safePath(destination, header.Name)
+		if err != nil {
+			return count, fmt.Errorf("tar entry %q: %w", header.Name, err)
+		}
+		if target == destination {
+			continue
+		}
+		if err := ensureSafeParents(destination, filepath.Dir(target)); err != nil {
+			return count, fmt.Errorf("tar entry %q: %w", header.Name, err)
+		}
+		switch header.Typeflag {
+		case tar.TypeDir:
+			err = os.MkdirAll(target, os.FileMode(header.Mode).Perm())
+		case tar.TypeSymlink:
+			err = os.Symlink(header.Linkname, target)
+		case tar.TypeReg, tar.TypeRegA:
+			err = writeFile(archive, target, os.FileMode(header.Mode).Perm())
+		default:
+			continue
+		}
+		if err != nil {
+			return count, fmt.Errorf("tar entry %q: %w", header.Name, err)
+		}
+		switch header.Typeflag {
+		case tar.TypeDir:
+			directories = append(directories, header)
+		case tar.TypeSymlink:
+		default:
+			applyMetadata(target, header)
+		}
+		count++
+	}
+	for index := len(directories) - 1; index >= 0; index-- {
+		header := directories[index]
+		target, _ := safePath(destination, header.Name)
+		applyMetadata(target, header)
+	}
+	return count, nil
 }
 
-func importTarEntry(tx *store.Tx, tr *tar.Reader, hdr *tar.Header) error {
-	name := path.Clean(strings.TrimPrefix(hdr.Name, "/"))
-	if name == "." || name == "" {
-		return nil
+func applyMetadata(target string, header *tar.Header) {
+	_ = os.Chown(target, header.Uid, header.Gid)
+	_ = os.Chtimes(target, header.AccessTime, header.ModTime)
+}
+
+func safePath(root, name string) (string, error) {
+	clean := filepath.Clean(filepath.FromSlash(strings.TrimPrefix(name, "/")))
+	if clean == "." || clean == "" {
+		return root, nil
 	}
-	if strings.HasPrefix(name, "../") || name == ".." {
-		return errors.New("path escapes archive root")
+	if clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return "", errors.New("path escapes archive root")
 	}
-	parent, err := tx.EnsureDir(path.Dir(name))
+	return filepath.Join(root, clean), nil
+}
+
+func ensureSafeParents(root, parent string) error {
+	rel, err := filepath.Rel(root, parent)
 	if err != nil {
 		return err
 	}
-	base := path.Base(name)
-	spec := store.NewInode{Uid: uint32(hdr.Uid), Gid: uint32(hdr.Gid), Time: hdr.ModTime}
-	switch hdr.Typeflag {
-	case tar.TypeDir:
-		spec.Mode = store.ModeFromFS(os.ModeDir | os.FileMode(hdr.Mode).Perm())
-		_, err := tx.Create(parent, base, spec)
-		if errors.Is(err, store.ErrExists) {
-			return nil
+	current := root
+	for _, part := range strings.Split(rel, string(filepath.Separator)) {
+		if part == "." || part == "" {
+			continue
 		}
-		return err
-	case tar.TypeSymlink:
-		spec.Mode = store.ModeFromFS(os.ModeSymlink | 0o777)
-		spec.Target = hdr.Linkname
-		_, err := tx.Create(parent, base, spec)
-		return err
-	case tar.TypeReg, tar.TypeRegA:
-		spec.Mode = store.ModeFromFS(os.FileMode(hdr.Mode).Perm())
-		attr, err := tx.Create(parent, base, spec)
+		current = filepath.Join(current, part)
+		info, err := os.Lstat(current)
+		if errors.Is(err, os.ErrNotExist) {
+			if err := os.Mkdir(current, 0o755); err != nil {
+				return err
+			}
+			continue
+		}
 		if err != nil {
 			return err
 		}
-		if err := tx.WriteFrom(attr.Ino, tr); err != nil {
-			return err
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return errors.New("archive parent is not a directory")
 		}
-		mtime := hdr.ModTime
-		_, err = tx.SetAttr(attr.Ino, store.AttrChange{Mtime: &mtime})
-		return err
-	default:
-		return nil
 	}
+	return nil
+}
+
+func copyFile(source, destination string, mode os.FileMode) error {
+	in, err := os.Open(source)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil {
+		return err
+	}
+	return writeFile(in, destination, mode)
+}
+
+func writeFile(reader io.Reader, destination string, mode os.FileMode) error {
+	if info, err := os.Lstat(destination); err == nil && !info.Mode().IsRegular() {
+		return fmt.Errorf("refusing to write through %s: not a regular file", destination)
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	out, err := os.OpenFile(destination, os.O_CREATE|os.O_WRONLY|os.O_TRUNC|unix.O_NOFOLLOW, mode)
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.Copy(out, reader)
+	closeErr := out.Close()
+	return errors.Join(copyErr, closeErr)
 }

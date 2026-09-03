@@ -9,13 +9,18 @@ import (
 )
 
 type Memory struct {
-	mu      sync.Mutex
-	objects map[string]Object
-	seq     int
+	mu            sync.Mutex
+	objects       map[string]Object
+	seq           int
+	unconditional bool
 }
 
 func NewMemory() *Memory {
 	return &Memory{objects: map[string]Object{}}
+}
+
+func NewUnconditionalMemory() *Memory {
+	return &Memory{objects: map[string]Object{}, unconditional: true}
 }
 
 func (m *Memory) Get(_ context.Context, key string) (Object, error) {
@@ -28,10 +33,16 @@ func (m *Memory) Get(_ context.Context, key string) (Object, error) {
 	return obj, nil
 }
 
+func (m *Memory) Put(_ context.Context, key string, data []byte) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.store(key, data), nil
+}
+
 func (m *Memory) PutIfAbsent(_ context.Context, key string, data []byte) (string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, exists := m.objects[key]; exists {
+	if _, exists := m.objects[key]; exists && !m.unconditional {
 		return "", ErrPreconditionFailed
 	}
 	return m.store(key, data), nil
@@ -41,7 +52,7 @@ func (m *Memory) PutIfMatch(_ context.Context, key string, data []byte, etag str
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	current, exists := m.objects[key]
-	if !exists || current.ETag != etag {
+	if !m.unconditional && (!exists || current.ETag != etag) {
 		return "", ErrPreconditionFailed
 	}
 	return m.store(key, data), nil

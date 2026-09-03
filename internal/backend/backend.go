@@ -1,9 +1,14 @@
 package backend
 
-import "context"
+import (
+	"context"
+
+	"github.com/zephyraoss/satchel/internal/replica"
+)
 
 type MountOptions struct {
-	ReadOnly bool
+	ReadOnly   bool
+	Filesystem string
 }
 
 type Unmounter interface {
@@ -12,6 +17,6 @@ type Unmounter interface {
 }
 
 type Backend interface {
-	Name() string
-	Mount(ctx context.Context, dbPath, mountpoint string, opts MountOptions) (Unmounter, error)
+	Format(ctx context.Context, imagePath, filesystem string) error
+	Mount(ctx context.Context, device *replica.Device, mountpoint string, opts MountOptions) (Unmounter, error)
 }

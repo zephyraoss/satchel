@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
@@ -37,10 +38,13 @@ func NewS3(cfg S3Config) *S3 {
 		region = "us-east-1"
 	}
 	client := s3.New(s3.Options{
-		Region:       region,
-		Credentials:  credentials.NewStaticCredentialsProvider(cfg.AccessKeyID, cfg.SecretKey, ""),
-		BaseEndpoint: optionalString(cfg.Endpoint),
-		UsePathStyle: cfg.ForcePathStyle,
+		Region:                       region,
+		Credentials:                  credentials.NewStaticCredentialsProvider(cfg.AccessKeyID, cfg.SecretKey, ""),
+		BaseEndpoint:                 optionalString(cfg.Endpoint),
+		UsePathStyle:                 cfg.ForcePathStyle,
+		ContinueHeaderThresholdBytes: -1,
+		RequestChecksumCalculation:   aws.RequestChecksumCalculationWhenRequired,
+		ResponseChecksumValidation:   aws.ResponseChecksumValidationWhenRequired,
 	})
 	return &S3{client: client, bucket: cfg.Bucket}
 }
@@ -68,21 +72,32 @@ func (s *S3) Get(ctx context.Context, key string) (Object, error) {
 	return Object{Data: data, ETag: aws.ToString(out.ETag)}, nil
 }
 
+func (s *S3) Put(ctx context.Context, key string, data []byte) (string, error) {
+	return s.put(ctx, &s3.PutObjectInput{
+		Bucket:        &s.bucket,
+		Key:           &key,
+		Body:          bytes.NewReader(data),
+		ContentLength: aws.Int64(int64(len(data))),
+	})
+}
+
 func (s *S3) PutIfAbsent(ctx context.Context, key string, data []byte) (string, error) {
 	return s.put(ctx, &s3.PutObjectInput{
-		Bucket:      &s.bucket,
-		Key:         &key,
-		Body:        bytes.NewReader(data),
-		IfNoneMatch: aws.String("*"),
+		Bucket:        &s.bucket,
+		Key:           &key,
+		Body:          bytes.NewReader(data),
+		ContentLength: aws.Int64(int64(len(data))),
+		IfNoneMatch:   aws.String("*"),
 	})
 }
 
 func (s *S3) PutIfMatch(ctx context.Context, key string, data []byte, etag string) (string, error) {
 	newETag, err := s.put(ctx, &s3.PutObjectInput{
-		Bucket:  &s.bucket,
-		Key:     &key,
-		Body:    bytes.NewReader(data),
-		IfMatch: aws.String(etag),
+		Bucket:        &s.bucket,
+		Key:           &key,
+		Body:          bytes.NewReader(data),
+		ContentLength: aws.Int64(int64(len(data))),
+		IfMatch:       aws.String(etag),
 	})
 	if isMissingKey(err) {
 		return "", ErrPreconditionFailed
@@ -164,7 +179,11 @@ func (s *S3) DeletePrefix(ctx context.Context, prefix string) error {
 
 func VerifyConditionalWrites(ctx context.Context, store Store) error {
 	probe := "leases/.probe-" + uuid.NewString()
-	defer store.Delete(context.WithoutCancel(ctx), probe)
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
+		_ = store.Delete(cleanupCtx, probe)
+	}()
 
 	etag, err := store.PutIfAbsent(ctx, probe, []byte("probe"))
 	if err != nil {
@@ -178,6 +197,42 @@ func VerifyConditionalWrites(ctx context.Context, store Store) error {
 	}
 	if _, err := store.PutIfMatch(ctx, probe, []byte("probe"), etag); err != nil {
 		return fmt.Errorf("If-Match PUT with the current ETag failed: %w", err)
+	}
+	return nil
+}
+
+func VerifyListedWrites(ctx context.Context, store Store) error {
+	prefix := "leases/.probe-" + uuid.NewString()
+	key := prefix + "/head"
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
+		_ = store.Delete(cleanupCtx, key)
+	}()
+
+	if _, err := store.Put(ctx, key, []byte("probe")); err != nil {
+		return fmt.Errorf("probe write: %w", err)
+	}
+	keys, err := store.List(ctx, prefix)
+	if err != nil {
+		return fmt.Errorf("probe list: %w", err)
+	}
+	if len(keys) != 1 || keys[0] != key {
+		return fmt.Errorf("backend listing did not return a just-written key (got %v); read-after-write listing is required for append heads", keys)
+	}
+	obj, err := store.Get(ctx, key)
+	if err != nil || string(obj.Data) != "probe" {
+		return fmt.Errorf("probe read after write failed (err=%v)", err)
+	}
+	if err := store.Delete(ctx, key); err != nil {
+		return fmt.Errorf("probe delete: %w", err)
+	}
+	keys, err = store.List(ctx, prefix)
+	if err != nil {
+		return fmt.Errorf("probe list after delete: %w", err)
+	}
+	if len(keys) != 0 {
+		return fmt.Errorf("backend listing still returns a deleted key (%v); append heads need prompt delete visibility", keys)
 	}
 	return nil
 }
