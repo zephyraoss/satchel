@@ -18,7 +18,7 @@ import (
 func newMountCommand() *cobra.Command {
 	opts := pluginOptions{}
 	volumeSize := "10GiB"
-	durability := "remote"
+	durability := "local"
 	seedSource := ""
 	cmd := &cobra.Command{
 		Use:   "mount <volume>",
@@ -41,7 +41,7 @@ func newMountCommand() *cobra.Command {
 	}
 	bindPluginFlags(cmd, &opts)
 	cmd.Flags().StringVar(&volumeSize, "size", "10GiB", "size to use when creating a new volume")
-	cmd.Flags().StringVar(&durability, "durability", "remote", "remote waits for S3 on fsync; async publishes on the sync interval")
+	cmd.Flags().StringVar(&durability, "durability", "local", "local syncs the host journal; remote waits for S3")
 	cmd.Flags().StringVar(&seedSource, "seed", "", "directory, tar archive, or s3:// URL used to initialize a new volume")
 	return cmd
 }

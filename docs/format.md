@@ -9,7 +9,15 @@ manifest-bundles/<sha256>.json
 segments/e<epoch>-g<generation>-<sha256>.seg.gz
 ```
 
-Segment, manifest, and manifest-bundle objects are immutable. Their names contain a SHA-256 digest. Segment names also contain the writer epoch and generation, which prevents a garbage collector from racing with a later writer that happens to produce identical block data. `state.json` is the only mutable volume object. Its format identifier is `satchel-block-v1`. Volumes published with the append head store the same state document under `heads/` instead of `state.json`; see [Append head](#append-head).
+Segment, manifest, and manifest-bundle objects are immutable. Their names contain a SHA-256 digest. Segment names also contain the writer epoch and generation, which prevents a garbage collector from racing with a later writer that happens to produce identical block data. `state.json` is the only mutable volume object. Its format identifier is `satchel-block-v2`. Volumes published with the append head store the same state document under `heads/` instead of `state.json`; see [Append head](#append-head).
+
+## Local journal
+
+With `durability=local`, Satchel stores a checksummed append-only journal under `--journal-dir`, which defaults to `<state-dir>/journals`. A record contains the complete 4 KiB value of every changed block in one generation. Satchel acknowledges a filesystem flush only after the record reaches stable local storage.
+
+After a restart, Satchel validates the journal's volume identity, base manifest, writer epoch, and node identity against the remote head. It restores the remote image, discards an incomplete final journal record, and replays complete records. A checksum failure is treated as corruption. If a different writer advanced the remote history, Satchel preserves the journal and refuses the mount because block-level histories cannot be merged safely.
+
+The replication worker marks journal records reclaimable only after the conditional remote head update succeeds. It compacts reclaimed data in batches instead of rewriting the journal after every S3 generation. Compaction uses a synced temporary file, atomic rename, and parent-directory sync. Recovery may replay already-published records after a crash between publication and compaction; replay is idempotent.
 
 ## State publication
 
@@ -72,7 +80,8 @@ For point-in-time recovery, Satchel walks parent links across checkpoints, selec
 - Losing a lease prevents further state publication.
 - An S3 error leaves the generation queued locally and applies backpressure when queued blocks reach the dirty limit.
 - With `durability=remote`, a successful filesystem flush has advanced `state.json`, including its inline manifest when needed. Unflushed writes can still be lost after a host failure.
-- With `durability=async`, a Satchel process failure, forced restart, or host failure can lose generations that did not advance `state.json`. An application crash alone does not unmount the local image.
+- With `durability=local`, a successful filesystem flush survives a Satchel crash or same-node reboot while the state disk remains intact. Loss of that disk can lose generations that did not advance the remote head.
+- A local journal whose remote history was advanced by another writer requires operator recovery. Satchel does not replay it automatically.
 - A corrupt segment or manifest fails the affected read or materialized restore. Satchel never returns unverified remote data.
 - S3 object listing is not part of restore correctness. Restore follows exact keys from `state.json`.
 

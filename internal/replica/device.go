@@ -20,8 +20,9 @@ var ErrDeviceClosed = errors.New("block device is closed")
 // interval. Blocks contains complete blocks, even when the original write was
 // smaller, so a later write cannot change a generation while it is uploading.
 type Generation struct {
-	Blocks map[uint64][]byte
-	bytes  int64
+	Blocks     map[uint64][]byte
+	bytes      int64
+	journalSeq uint64
 }
 
 func (g *Generation) Empty() bool { return g == nil || len(g.Blocks) == 0 }
@@ -40,11 +41,9 @@ func (g *Generation) Bytes() int64 {
 	return n
 }
 
-// Device is the local backing image and its in-memory change journal.
-//
-// The journal is intentionally not durable. A machine failure may lose writes
-// that have not reached S3, as controlled by the sync interval. The image is
-// also disposable and is rebuilt from S3 whenever a volume mounts.
+// Device is the disposable local image and its in-memory set of changed blocks.
+// A durability handler commits sealed generations to the local Journal or S3.
+// A new mount rebuilds the image from those recovery sources.
 type Device struct {
 	mu             sync.Mutex
 	ready          *sync.Cond
@@ -60,13 +59,13 @@ type Device struct {
 	dirtyThreshold int64
 	dirtyNotified  bool
 	onFlush        func() error
-	onRemoteFlush  func(*Generation) <-chan error
+	onDurableFlush func(*Generation) <-chan error
 	skipLocalFlush bool
 	localDirty     bool
 	blockPool      sync.Pool
 	hydrator       *LazyImage
 	closed         bool
-	remoteFlush    atomic.Bool
+	queuedFlush    atomic.Bool
 }
 
 func OpenDevice(path string, size, maxDirty int64) (*Device, error) {
@@ -133,55 +132,69 @@ func (d *Device) observeDirtyLocked() {
 func (d *Device) SetFlushHandler(handler func() error) {
 	d.mu.Lock()
 	d.onFlush = handler
-	d.onRemoteFlush = nil
+	d.onDurableFlush = nil
 	d.skipLocalFlush = false
 	d.mu.Unlock()
-	d.remoteFlush.Store(false)
+	d.queuedFlush.Store(false)
 }
 
-// SetAsyncFlush makes filesystem flushes ordering barriers without syncing the
-// disposable local image. The in-memory generation journal remains the source
-// for background replication, so syncing the image would not improve the
-// recovery point after an unclean remount.
-func (d *Device) SetAsyncFlush() {
+// SetDurableFlushHandler sets a function whose successful completion makes all
+// prior writes durable without relying on the disposable local image. The
+// handler may commit them to the local journal or publish them remotely.
+func (d *Device) SetDurableFlushHandler(handler func(*Generation) <-chan error) {
 	d.mu.Lock()
 	d.onFlush = nil
-	d.onRemoteFlush = nil
+	d.onDurableFlush = handler
 	d.skipLocalFlush = true
 	d.mu.Unlock()
-	d.remoteFlush.Store(false)
+	d.queuedFlush.Store(true)
 }
 
-// SetRemoteFlushHandler sets a function whose successful completion makes all
-// prior writes durable without relying on the disposable local image. Satchel
-// uses it when the handler publishes those writes to remote storage.
-func (d *Device) SetRemoteFlushHandler(handler func(*Generation) <-chan error) {
-	d.mu.Lock()
-	d.onFlush = nil
-	d.onRemoteFlush = handler
-	d.skipLocalFlush = true
-	d.mu.Unlock()
-	d.remoteFlush.Store(true)
-}
+// QueuedFlushEnabled reports whether filesystem flushes use a handler that can
+// run while the NBD server accepts later local I/O.
+func (d *Device) QueuedFlushEnabled() bool { return d.queuedFlush.Load() }
 
-// RemoteFlushEnabled reports whether filesystem flushes wait for remote
-// publication. The NBD server uses it to overlap that network wait with later
-// local I/O while keeping the cheaper serial path for async durability.
-func (d *Device) RemoteFlushEnabled() bool { return d.remoteFlush.Load() }
-
-// BeginRemoteFlush seals the current write generation and queues it while
+// BeginDurableFlush seals the current write generation and queues it while
 // holding the device lock. Writes that start after this method returns belong
 // to a later flush boundary and may proceed while the caller waits for result.
-func (d *Device) BeginRemoteFlush() (<-chan error, error) {
+func (d *Device) BeginDurableFlush() (<-chan error, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.closed {
 		return nil, ErrDeviceClosed
 	}
-	if d.onRemoteFlush == nil {
-		return nil, errors.New("remote flush is not configured")
+	if d.onDurableFlush == nil {
+		return nil, errors.New("durable flush is not configured")
 	}
-	return d.onRemoteFlush(d.sealLocked()), nil
+	return d.onDurableFlush(d.sealLocked()), nil
+}
+
+// Replay applies locally journaled generations to a freshly restored image and
+// accounts for them as unpublished data. The generations stay immutable until
+// the replication worker publishes and releases them.
+func (d *Device) Replay(generations []*Generation) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.closed {
+		return ErrDeviceClosed
+	}
+	for _, generation := range generations {
+		for block, data := range generation.Blocks {
+			if len(data) != int(d.blockSize) || block >= uint64(d.size/d.blockSize) {
+				return fmt.Errorf("invalid journal block %d", block)
+			}
+			offset := int64(block) * d.blockSize
+			if _, err := d.file.WriteAt(data, offset); err != nil {
+				return err
+			}
+			if d.hydrator != nil {
+				d.hydrator.CommitWrite(offset, d.blockSize)
+			}
+		}
+		d.dirty += generation.Bytes()
+	}
+	d.observeDirtyLocked()
+	return nil
 }
 
 func (d *Device) SetLazyImage(image *LazyImage) {
@@ -324,17 +337,17 @@ func (d *Device) Flush() error {
 			d.localDirty = false
 		}
 	}
-	remoteHandler := d.onRemoteFlush
-	var remoteResult <-chan error
-	if err == nil && remoteHandler != nil {
-		remoteResult = remoteHandler(d.sealLocked())
+	durableHandler := d.onDurableFlush
+	var durableResult <-chan error
+	if err == nil && durableHandler != nil {
+		durableResult = durableHandler(d.sealLocked())
 	}
 	d.mu.Unlock()
 	if err != nil {
 		return err
 	}
-	if remoteResult != nil {
-		return <-remoteResult
+	if durableResult != nil {
+		return <-durableResult
 	}
 	if handler != nil {
 		return handler()

@@ -3,6 +3,7 @@ package replica
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -11,6 +12,7 @@ import (
 type Syncer struct {
 	device             *Device
 	lease              *Lease
+	journal            *Journal
 	interval           time.Duration
 	checkpointInterval uint64
 	log                *slog.Logger
@@ -33,9 +35,12 @@ type syncRequest struct {
 	generation *Generation
 	checkpoint bool
 	result     chan error
+	ready      <-chan error
 }
 
-func StartSyncer(device *Device, lease *Lease, interval time.Duration, checkpointInterval uint64, logger *slog.Logger, onLost func(error)) *Syncer {
+var ErrLocalJournal = errors.New("local journal failed")
+
+func StartSyncer(device *Device, lease *Lease, interval time.Duration, checkpointInterval uint64, logger *slog.Logger, onLost func(error), journal *Journal) *Syncer {
 	if interval <= 0 {
 		interval = 5 * time.Second
 	}
@@ -48,6 +53,7 @@ func StartSyncer(device *Device, lease *Lease, interval time.Duration, checkpoin
 		wake: make(chan struct{}, 1), urgent: make(chan struct{}, 1), done: make(chan struct{}), cancel: cancel, onLost: onLost,
 		retryInitial: 100 * time.Millisecond, retryMax: 2 * time.Second,
 	}
+	s.journal = journal
 	go s.run(ctx)
 	return s
 }
@@ -67,14 +73,14 @@ func (s *Syncer) run(ctx context.Context) {
 				continue
 			}
 			err := s.process(ctx, &pending, request)
-			if errors.Is(err, ErrLeaseLost) {
+			if errors.Is(err, ErrLeaseLost) || errors.Is(err, ErrLocalJournal) {
 				s.lose(err)
 				return
 			}
 		case <-s.urgent:
 			err := s.process(ctx, &pending, s.backgroundRequest())
 			if err != nil {
-				if errors.Is(err, ErrLeaseLost) {
+				if errors.Is(err, ErrLeaseLost) || errors.Is(err, ErrLocalJournal) {
 					s.lose(err)
 					return
 				}
@@ -83,7 +89,7 @@ func (s *Syncer) run(ctx context.Context) {
 		case <-syncTicker.C:
 			err := s.process(ctx, &pending, s.backgroundRequest())
 			if err != nil {
-				if errors.Is(err, ErrLeaseLost) {
+				if errors.Is(err, ErrLeaseLost) || errors.Is(err, ErrLocalJournal) {
 					s.lose(err)
 					return
 				}
@@ -99,7 +105,16 @@ func (s *Syncer) backgroundRequest() syncRequest {
 	if request, ok := s.dequeue(); ok {
 		return request
 	}
-	return syncRequest{generation: s.device.sealLocked()}
+	return s.prepareLocalGeneration(s.device.sealLocked())
+}
+
+func (s *Syncer) prepareLocalGeneration(generation *Generation) syncRequest {
+	request := syncRequest{generation: generation}
+	if s.journal == nil || generation.Empty() {
+		return request
+	}
+	_, request.ready = s.journal.Enqueue(generation)
+	return request
 }
 
 func (s *Syncer) process(ctx context.Context, pending *[]*Generation, first syncRequest) error {
@@ -117,6 +132,22 @@ func (s *Syncer) process(ctx context.Context, pending *[]*Generation, first sync
 
 	checkpoint := false
 	for _, request := range requests {
+		if request.ready != nil {
+			select {
+			case err := <-request.ready:
+				if err != nil {
+					err = fmt.Errorf("%w: %v", ErrLocalJournal, err)
+					for _, queued := range requests {
+						if queued.result != nil {
+							queued.result <- err
+						}
+					}
+					return err
+				}
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
 		if !request.generation.Empty() {
 			*pending = append(*pending, request.generation)
 		}
@@ -165,6 +196,15 @@ func (s *Syncer) sync(ctx context.Context, pending *[]*Generation) error {
 	s.lease.remote.observeGeneration(generation, segments)
 	if err := s.publishWithRetry(ctx, segments); err != nil {
 		return err
+	}
+	var journalSequence uint64
+	for _, published := range *pending {
+		journalSequence = max(journalSequence, published.journalSeq)
+	}
+	if s.journal != nil && journalSequence > 0 {
+		if err := s.journal.Acknowledge(journalSequence, s.lease.State()); err != nil {
+			return fmt.Errorf("%w: acknowledge remote generation: %v", ErrLocalJournal, err)
+		}
 	}
 	for _, published := range *pending {
 		s.device.Release(published)
@@ -231,11 +271,32 @@ func (s *Syncer) Sync(ctx context.Context) error {
 // have reached remote storage.
 func (s *Syncer) EnqueueGeneration(generation *Generation) <-chan error {
 	result := make(chan error, 1)
-	s.enqueue(syncRequest{generation: generation, result: result})
+	s.enqueue(syncRequest{generation: generation, result: result}, true)
 	return result
 }
 
-func (s *Syncer) enqueue(request syncRequest) {
+// EnqueueLocalGeneration commits a generation to the local journal and leaves
+// remote publication to the normal interval or dirty-data wakeup.
+func (s *Syncer) EnqueueLocalGeneration(generation *Generation) <-chan error {
+	if s.journal == nil {
+		result := make(chan error, 1)
+		result <- errors.New("local journal is not configured")
+		return result
+	}
+	acknowledged, ready := s.journal.Enqueue(generation)
+	if !generation.Empty() {
+		s.enqueue(syncRequest{generation: generation, ready: ready}, false)
+	}
+	return acknowledged
+}
+
+func (s *Syncer) EnqueueRecovered(generations []*Generation) {
+	for _, generation := range generations {
+		s.enqueue(syncRequest{generation: generation}, false)
+	}
+}
+
+func (s *Syncer) enqueue(request syncRequest, wake bool) {
 	s.queueMu.Lock()
 	if s.closed {
 		s.queueMu.Unlock()
@@ -246,6 +307,9 @@ func (s *Syncer) enqueue(request syncRequest) {
 	}
 	s.requests = append(s.requests, request)
 	s.queueMu.Unlock()
+	if !wake {
+		return
+	}
 	select {
 	case s.wake <- struct{}{}:
 	default:
@@ -313,7 +377,10 @@ func (s *Syncer) request(ctx context.Context, checkpoint bool) error {
 	result := make(chan error, 1)
 	s.device.mu.Lock()
 	generation := s.device.sealLocked()
-	s.enqueue(syncRequest{generation: generation, checkpoint: checkpoint, result: result})
+	request := s.prepareLocalGeneration(generation)
+	request.checkpoint = checkpoint
+	request.result = result
+	s.enqueue(request, true)
 	s.device.mu.Unlock()
 	select {
 	case err := <-result:

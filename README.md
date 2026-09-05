@@ -6,20 +6,20 @@ Satchel permits one writer per volume. It is not a shared filesystem.
 
 ## Status
 
-The block format is new and not compatible with the former SQLite and Litestream format. There is no migration path because the old format had no production users.
+The current block format is `satchel-block-v2`. It is not compatible with `satchel-block-v1` or the former SQLite and Litestream format. There is no migration path because those formats had no production users.
 
-By default, `fsync` and FUA writes wait until Satchel publishes the current generation to S3. A database can therefore treat a successful `fsync` as durable across node loss. `durability=async` treats `fsync` as an ordering barrier and does not sync the local image or wait for S3. If only the application or PostgreSQL process crashes, the still-running Satchel mount retains its writes. A Satchel process crash, forced restart, or host failure can lose every generation that has not reached S3. Clean Satchel shutdown publishes queued changes. The sync interval defaults to five seconds.
+By default, `fsync` and FUA writes append changed blocks to a durable local journal before returning. S3 publication remains asynchronous, so commit latency depends on the local disk instead of an S3 round trip. The journal recovers acknowledged writes after a Satchel crash or same-node reboot. A lost node or disk can still lose generations that have not reached S3. Set `durability=remote` when a successful `fsync` must survive node loss; that mode waits until the current generation reaches S3. The sync interval defaults to five seconds.
 
 ## How it works
 
-Each mounted volume is an ext4 filesystem on a Linux NBD device. Satchel writes through to a sparse local image and records complete 4 KiB blocks in the current generation. At each sync interval, and on every filesystem flush in remote durability mode, Satchel:
+Each mounted volume is an ext4 filesystem on a Linux NBD device. Satchel writes through to a sparse local image and records complete 4 KiB blocks in the current generation. Local durability appends sealed generations to a checksummed journal on each filesystem flush. At each sync interval, and on every filesystem flush in remote durability mode, Satchel:
 
 1. Seals the current generation.
 2. Compresses changed blocks into bounded segments.
 3. Uploads any segment too large to keep inline.
 4. Advances the volume head with a conditional S3 write that includes the new manifest when it fits within the bounded inline area.
 
-The volume lease and published generation live in the same state object. A stale writer may upload unused objects, but it cannot advance the volume head after another node takes the lease. Backends that lack conditional writes, such as Garage, use `--s3-head=append`, which keeps the head as an append-only version log instead of one `If-Match` object. See [docs/format.md](docs/format.md#append-head) for the tradeoffs.
+After a crash, Satchel restores the S3 head and replays the local journal before exposing the filesystem. It refuses automatic replay if another writer advanced the remote history. The volume lease and published generation live in the same state object. A stale writer may upload unused objects, but it cannot advance the volume head after another node takes the lease. Backends that lack conditional writes, such as Garage, use `--s3-head=append`, which keeps the head as an append-only version log instead of one `If-Match` object. See [docs/format.md](docs/format.md#append-head) for the tradeoffs.
 
 Satchel starts packing inline history into immutable manifest bundles at 16 KiB, with a 64 KiB hard limit. The state keeps one pointer to the newest bundle, and bundles link to older bundles. This keeps the mutable object bounded without adding a second S3 request to every small commit.
 
@@ -31,6 +31,7 @@ See [docs/format.md](docs/format.md) for the on-bucket format and failure rules.
 
 - Linux with the `nbd` kernel module
 - `mkfs.ext4` and `mount`
+- A persistent local filesystem for `--journal-dir`; never place the journal on tmpfs
 - An S3-compatible bucket with working `If-Match` and `If-None-Match` writes, or a bucket on a backend without them (Garage) run with `--s3-head=append`
 
 Load enough NBD devices for the number of volumes that may be mounted on a node:
@@ -43,10 +44,11 @@ sudo modprobe nbd nbds_max=64
 
 ### Managed Docker plugin
 
-Load the NBD module before installing the plugin. The bundled plugin manifest exposes `/dev/nbd0` through `/dev/nbd15`, so the managed plugin supports 16 simultaneous mounts per node.
+Load the NBD module and create the persistent state directories before installing the plugin. The bundled plugin manifest exposes `/dev/nbd0` through `/dev/nbd15`, so the managed plugin supports 16 simultaneous mounts per node.
 
 ```sh
 sudo modprobe nbd nbds_max=16
+sudo install -d -m 0700 /var/lib/satchel/volumes /var/lib/satchel/images /var/lib/satchel/journals /var/lib/satchel/mounts
 ./deploy/plugin/build.sh
 docker plugin set zephyraoss/satchel:dev \
   SATCHEL_S3_ENDPOINT=http://storage-node:9000 \
@@ -84,7 +86,7 @@ With uncloud, use `driver: satchel` in the Compose volume definition.
 | `size` | byte count or `KiB`, `MiB`, `GiB` | Virtual volume size. Default `10GiB`, minimum `64MiB`. |
 | `mode` | `rw`, `ro` | Read-only mounts restore a fixed snapshot and do not take a lease. |
 | `scope` | `volume`, `replica` | Replica scope derives a separate volume name from each Docker mount ID. |
-| `durability` | `remote`, `async` | `remote` makes `fsync` wait for S3 and is the default. `async` acknowledges flushes without local or remote stable storage and publishes in the background. |
+| `durability` | `local`, `remote` | `local` is the default: `fsync` waits for the host journal while S3 replication runs in the background. `remote` waits for S3 and survives node loss. |
 | `seed` | directory, `.tar`, `.tgz`, or `s3://` URL | Copies initial files into a newly formatted volume. |
 | `sync_interval` | Go duration | Overrides the five-second generation interval. |
 | `filesystem` | `ext4` | Filesystem written into the block image. |
@@ -113,6 +115,7 @@ satchel vol rm app-data
 |---|---|---|
 | `--node-id` | `SATCHEL_NODE_ID` | hostname |
 | `--state-dir` | `SATCHEL_STATE_DIR` | `/var/lib/satchel` |
+| `--journal-dir` | `SATCHEL_JOURNAL_DIR` | `<state-dir>/journals` |
 | `--s3-endpoint` | `SATCHEL_S3_ENDPOINT` | AWS S3 |
 | `--s3-bucket` | `SATCHEL_S3_BUCKET` | required |
 | `--s3-access-key` | `SATCHEL_S3_ACCESS_KEY` | `AWS_ACCESS_KEY_ID` |

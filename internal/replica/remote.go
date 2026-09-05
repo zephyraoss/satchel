@@ -21,7 +21,7 @@ import (
 	"github.com/zephyraoss/satchel/internal/objectstore"
 )
 
-const Format = "satchel-block-v1"
+const Format = "satchel-block-v2"
 
 var validVolumeName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
 

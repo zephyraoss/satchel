@@ -116,7 +116,7 @@ func unmount(ctx context.Context, mountpoint string, flags int) error {
 	defer deadline.Stop()
 	for {
 		err := syscall.Unmount(mountpoint, flags)
-		if err == nil || errors.Is(err, syscall.EINVAL) {
+		if err == nil || errors.Is(err, syscall.EINVAL) || errors.Is(err, syscall.ENOENT) {
 			return nil
 		}
 		if !errors.Is(err, syscall.EBUSY) || flags&syscall.MNT_DETACH != 0 {

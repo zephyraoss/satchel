@@ -134,7 +134,7 @@ func TestRemoteFlushUsesRemoteDurabilityInsteadOfLocalImageSync(t *testing.T) {
 		t.Fatal(err)
 	}
 	called := false
-	device.SetRemoteFlushHandler(func(*Generation) <-chan error {
+	device.SetDurableFlushHandler(func(*Generation) <-chan error {
 		called = true
 		result := make(chan error, 1)
 		result <- nil
@@ -145,23 +145,6 @@ func TestRemoteFlushUsesRemoteDurabilityInsteadOfLocalImageSync(t *testing.T) {
 	}
 	if !called {
 		t.Fatal("remote durability handler was not called")
-	}
-}
-
-func TestAsyncFlushDoesNotSyncDisposableImage(t *testing.T) {
-	device, err := OpenDevice(filepath.Join(t.TempDir(), "image"), 4*DefaultBlockSize, 4*DefaultBlockSize)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := device.WriteAt([]byte("unpublished"), 0); err != nil {
-		t.Fatal(err)
-	}
-	device.SetAsyncFlush()
-	if err := device.file.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := device.Flush(); err != nil {
-		t.Fatalf("async flush used the closed disposable image: %v", err)
 	}
 }
 
@@ -600,7 +583,7 @@ func TestSyncerNotifyPublishesBeforeInterval(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer device.Close()
-	syncer := StartSyncer(device, lease, time.Hour, 0, nil, nil)
+	syncer := StartSyncer(device, lease, time.Hour, 0, nil, nil, nil)
 	if _, err := device.WriteAt([]byte("urgent"), 0); err != nil {
 		t.Fatal(err)
 	}
@@ -613,6 +596,63 @@ func TestSyncerNotifyPublishesBeforeInterval(t *testing.T) {
 		t.Fatalf("generation after urgent notification = %d, want 1", got)
 	}
 	if err := syncer.Stop(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLocalFlushIsDurableWhileBackgroundPublishIsBlocked(t *testing.T) {
+	ctx := context.Background()
+	store := &blockingStateStore{
+		Store: objectstore.NewMemory(), stateStarted: make(chan struct{}), releaseState: make(chan struct{}),
+	}
+	remote := &Remote{Store: store}
+	lease, _, err := remote.Acquire(ctx, "local-background", "node-a", CreateOptions{Size: 8 * DefaultBlockSize})
+	if err != nil {
+		t.Fatal(err)
+	}
+	device, err := OpenDevice(filepath.Join(t.TempDir(), "image"), 8*DefaultBlockSize, 8*DefaultBlockSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer device.Close()
+	journal, err := CreateJournal(filepath.Join(t.TempDir(), "journal"), lease.State())
+	if err != nil {
+		t.Fatal(err)
+	}
+	syncer := StartSyncer(device, lease, time.Hour, 0, nil, nil, journal)
+	device.SetDurableFlushHandler(syncer.EnqueueLocalGeneration)
+	if _, err := device.WriteAt(bytes.Repeat([]byte{'l'}, DefaultBlockSize), 0); err != nil {
+		t.Fatal(err)
+	}
+	syncer.Notify()
+	select {
+	case <-store.stateStarted:
+	case <-time.After(time.Second):
+		t.Fatal("background publish did not start")
+	}
+	if _, err := device.WriteAt(bytes.Repeat([]byte{'n'}, DefaultBlockSize), DefaultBlockSize); err != nil {
+		t.Fatal(err)
+	}
+
+	flushDone := make(chan error, 1)
+	go func() { flushDone <- device.Flush() }()
+	select {
+	case err := <-flushDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("local flush waited for blocked remote publication")
+	}
+	if entries := journal.Entries(); len(entries) != 2 {
+		t.Fatalf("journal entries = %d, want 2", len(entries))
+	}
+
+	close(store.releaseState)
+	if err := syncer.Stop(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := journal.Close(true); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -632,15 +672,15 @@ func TestSyncerGroupsQueuedFlushGenerations(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer device.Close()
-	syncer := StartSyncer(device, lease, time.Hour, 0, nil, nil)
-	device.SetRemoteFlushHandler(syncer.EnqueueGeneration)
+	syncer := StartSyncer(device, lease, time.Hour, 0, nil, nil, nil)
+	device.SetDurableFlushHandler(syncer.EnqueueGeneration)
 
 	results := make([]<-chan error, 0, 3)
 	for block, value := range []byte{'a', 'b', 'c'} {
 		if _, err := device.WriteAt(bytes.Repeat([]byte{value}, DefaultBlockSize), int64(block*DefaultBlockSize)); err != nil {
 			t.Fatal(err)
 		}
-		result, err := device.BeginRemoteFlush()
+		result, err := device.BeginDurableFlush()
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1518,8 +1558,8 @@ func newFlushingSyncer(t *testing.T, store objectstore.Store, onLost func(error)
 	if err != nil {
 		t.Fatal(err)
 	}
-	syncer := StartSyncer(device, lease, time.Hour, 0, nil, onLost)
-	device.SetRemoteFlushHandler(syncer.EnqueueGeneration)
+	syncer := StartSyncer(device, lease, time.Hour, 0, nil, onLost, nil)
+	device.SetDurableFlushHandler(syncer.EnqueueGeneration)
 	return device, syncer
 }
 

@@ -279,7 +279,7 @@ func serveNBD(conn net.Conn, device *replica.Device, readOnly bool) error {
 	dispatchBarrier := func(handle [8]byte, requestErr error) {
 		var remoteResult <-chan error
 		if requestErr == nil {
-			remoteResult, requestErr = device.BeginRemoteFlush()
+			remoteResult, requestErr = device.BeginDurableFlush()
 		}
 		prior := previousBarrier
 		done := make(chan struct{})
@@ -340,7 +340,7 @@ func serveNBD(conn net.Conn, device *replica.Device, readOnly bool) error {
 			}
 		}
 		if command == nbdCmdFlush {
-			if device.RemoteFlushEnabled() {
+			if device.QueuedFlushEnabled() {
 				dispatchBarrier(handle, nil)
 			} else if err := sendReply(handle, device.Flush(), nil); err != nil {
 				return waitForWorkers(err)
@@ -371,7 +371,7 @@ func serveNBD(conn net.Conn, device *replica.Device, readOnly bool) error {
 		}
 		fuaWrite := (command == nbdCmdWrite || command == nbdCmdTrim || command == nbdCmdWriteZeroes) && typeAndFlags&nbdCmdFlagFUA != 0
 		if fuaWrite {
-			if device.RemoteFlushEnabled() {
+			if device.QueuedFlushEnabled() {
 				dispatchBarrier(handle, requestErr)
 			} else {
 				if requestErr == nil {

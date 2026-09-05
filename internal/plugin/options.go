@@ -21,11 +21,13 @@ type VolumeOptions struct {
 func (o VolumeOptions) ReadOnly() bool   { return o.Mode == "ro" }
 func (o VolumeOptions) PerReplica() bool { return o.Scope == "replica" }
 func (o VolumeOptions) RemoteDurability() bool {
-	return o.Durability != "async"
+	return o.Durability == "remote"
 }
 
+func (o VolumeOptions) LocalDurability() bool { return o.Durability == "local" }
+
 func ParseVolumeOptions(raw map[string]string) (VolumeOptions, error) {
-	opts := VolumeOptions{Mode: "rw", Scope: "volume", Durability: "remote", Size: DefaultVolumeSize, Filesystem: "ext4"}
+	opts := VolumeOptions{Mode: "rw", Scope: "volume", Durability: "local", Size: DefaultVolumeSize, Filesystem: "ext4"}
 	for key, value := range raw {
 		switch key {
 		case "mode":
@@ -39,8 +41,8 @@ func ParseVolumeOptions(raw map[string]string) (VolumeOptions, error) {
 			}
 			opts.Scope = value
 		case "durability":
-			if value != "remote" && value != "async" {
-				return opts, fmt.Errorf("durability must be remote or async, got %q", value)
+			if value != "remote" && value != "local" {
+				return opts, fmt.Errorf("durability must be local or remote, got %q", value)
 			}
 			opts.Durability = value
 		case "seed":

@@ -58,9 +58,32 @@ type countingListStore struct {
 	lists atomic.Int64
 }
 
+type getHookStore struct {
+	objectstore.Store
+	mu   sync.Mutex
+	hook func() error
+}
+
 func (s *countingListStore) List(ctx context.Context, prefix string) ([]string, error) {
 	s.lists.Add(1)
 	return s.Store.List(ctx, prefix)
+}
+
+func (s *getHookStore) Get(ctx context.Context, key string) (objectstore.Object, error) {
+	object, err := s.Store.Get(ctx, key)
+	if err != nil || key != replica.StateKey("data") {
+		return object, err
+	}
+	s.mu.Lock()
+	hook := s.hook
+	s.hook = nil
+	s.mu.Unlock()
+	if hook != nil {
+		if err := hook(); err != nil {
+			return objectstore.Object{}, err
+		}
+	}
+	return object, nil
 }
 
 func (s *blockingManifestStore) PutIfAbsent(ctx context.Context, key string, data []byte) (string, error) {
@@ -78,15 +101,208 @@ func (s *blockingManifestStore) PutIfAbsent(ctx context.Context, key string, dat
 
 func newTestDriver(t *testing.T, store objectstore.Store, node string) (*Driver, *fakeBackend) {
 	t.Helper()
+	return newTestDriverAt(t, store, node, t.TempDir(), nil)
+}
+
+func newTestDriverAt(t *testing.T, store objectstore.Store, node, stateDir string, now func() time.Time) (*Driver, *fakeBackend) {
+	t.Helper()
 	be := &fakeBackend{}
 	driver, err := New(
-		Config{NodeID: node, StateDir: t.TempDir(), MaxDirty: 1 << 20, CheckpointInterval: 1},
-		&replica.Remote{Store: store, TTL: time.Minute}, be,
+		Config{NodeID: node, StateDir: stateDir, MaxDirty: 1 << 20, CheckpointInterval: 1},
+		&replica.Remote{Store: store, TTL: time.Minute, Now: now}, be,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return driver, be
+}
+
+func TestDriverUsesConfiguredJournalDirectory(t *testing.T) {
+	stateDir := t.TempDir()
+	journalDir := filepath.Join(t.TempDir(), "fast-journals")
+	driver, err := New(
+		Config{NodeID: "node-a", StateDir: stateDir, JournalDir: journalDir},
+		&replica.Remote{Store: objectstore.NewMemory()},
+		&fakeBackend{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := driver.journalPath("data"), filepath.Join(journalDir, "data.journal"); got != want {
+		t.Fatalf("journal path = %q, want %q", got, want)
+	}
+	if info, err := os.Stat(journalDir); err != nil || !info.IsDir() {
+		t.Fatalf("configured journal directory was not created: %v", err)
+	}
+}
+
+func crashTestMount(t *testing.T, driver *Driver, name string) {
+	t.Helper()
+	state := driver.volumes[name]
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	mount := state.mounts[name]
+	mount.syncer.Abandon()
+	mount.stopBeat()
+	_ = mount.unmounter.Abandon()
+	_ = mount.device.Close()
+	if err := mount.journal.Close(false); err != nil {
+		t.Fatal(err)
+	}
+	mount.active = false
+}
+
+func TestLocalJournalRecoversAfterSatchelCrash(t *testing.T) {
+	store := objectstore.NewMemory()
+	stateDir := t.TempDir()
+	now := time.Now().UTC()
+	clock := func() time.Time { return now }
+	driver, backend := newTestDriverAt(t, store, "node-a", stateDir, clock)
+	options := map[string]string{"size": "64MiB", "durability": "local", "sync_interval": "1h"}
+	if err := driver.Create(&volume.CreateRequest{Name: "data", Options: options}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := driver.Mount(&volume.MountRequest{Name: "data", ID: "container"}); err != nil {
+		t.Fatal(err)
+	}
+	want := bytes.Repeat([]byte{'d'}, replica.DefaultBlockSize)
+	if _, err := backend.device.WriteAt(want, 4*replica.DefaultBlockSize); err != nil {
+		t.Fatal(err)
+	}
+	if err := backend.device.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	before, _, err := driver.remote.Inspect(context.Background(), "data")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	crashTestMount(t, driver, "data")
+	now = now.Add(2 * time.Minute)
+
+	restarted, restartedBackend := newTestDriverAt(t, store, "node-a", stateDir, clock)
+	if _, err := restarted.Mount(&volume.MountRequest{Name: "data", ID: "container"}); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, len(want))
+	if _, err := restartedBackend.device.ReadAt(got, 4*replica.DefaultBlockSize); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("restarted mount did not replay the acknowledged local generation")
+	}
+	if err := restarted.Unmount(&volume.UnmountRequest{Name: "data", ID: "container"}); err != nil {
+		t.Fatal(err)
+	}
+	after, _, err := restarted.remote.Inspect(context.Background(), "data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Generation <= before.Generation {
+		t.Fatalf("recovered generation was not published: before=%d after=%d", before.Generation, after.Generation)
+	}
+	if _, err := os.Stat(restarted.journalPath("data")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("clean unmount retained local journal: %v", err)
+	}
+}
+
+func TestLocalJournalRefusesReplayAfterAnotherWriterAdvances(t *testing.T) {
+	store := objectstore.NewMemory()
+	stateDir := t.TempDir()
+	now := time.Now().UTC()
+	clock := func() time.Time { return now }
+	driver, backend := newTestDriverAt(t, store, "node-a", stateDir, clock)
+	options := map[string]string{"size": "64MiB", "durability": "local", "sync_interval": "1h"}
+	if err := driver.Create(&volume.CreateRequest{Name: "data", Options: options}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := driver.Mount(&volume.MountRequest{Name: "data", ID: "container"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := backend.device.WriteAt(bytes.Repeat([]byte{'a'}, replica.DefaultBlockSize), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := backend.device.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	crashTestMount(t, driver, "data")
+	now = now.Add(2 * time.Minute)
+
+	remote := &replica.Remote{Store: store, TTL: time.Minute, Now: clock}
+	other, _, err := remote.Acquire(context.Background(), "data", "node-b", replica.CreateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	segment, err := replica.EncodeSegment(&replica.Generation{Blocks: map[uint64][]byte{
+		1: bytes.Repeat([]byte{'b'}, replica.DefaultBlockSize),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := other.Publish(context.Background(), segment); err != nil {
+		t.Fatal(err)
+	}
+	if err := other.Release(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted, _ := newTestDriverAt(t, store, "node-a", stateDir, clock)
+	if _, err := restarted.Mount(&volume.MountRequest{Name: "data", ID: "container"}); !errors.Is(err, replica.ErrJournalConflict) {
+		t.Fatalf("mount error = %v, want journal conflict", err)
+	}
+	if _, err := os.Stat(restarted.journalPath("data")); err != nil {
+		t.Fatalf("conflicting journal was not preserved: %v", err)
+	}
+}
+
+func TestLocalJournalRechecksRemoteHistoryAfterAcquiringLease(t *testing.T) {
+	store := objectstore.NewMemory()
+	stateDir := t.TempDir()
+	now := time.Now().UTC()
+	clock := func() time.Time { return now }
+	driver, backend := newTestDriverAt(t, store, "node-a", stateDir, clock)
+	options := map[string]string{"size": "64MiB", "durability": "local", "sync_interval": "1h"}
+	if err := driver.Create(&volume.CreateRequest{Name: "data", Options: options}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := driver.Mount(&volume.MountRequest{Name: "data", ID: "container"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := backend.device.WriteAt(bytes.Repeat([]byte{'a'}, replica.DefaultBlockSize), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := backend.device.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	crashTestMount(t, driver, "data")
+	now = now.Add(2 * time.Minute)
+
+	hooked := &getHookStore{Store: store}
+	hooked.hook = func() error {
+		otherRemote := &replica.Remote{Store: store, TTL: time.Minute, Now: clock}
+		other, _, err := otherRemote.Acquire(context.Background(), "data", "node-b", replica.CreateOptions{})
+		if err != nil {
+			return err
+		}
+		segment, err := replica.EncodeSegment(&replica.Generation{Blocks: map[uint64][]byte{
+			1: bytes.Repeat([]byte{'b'}, replica.DefaultBlockSize),
+		}})
+		if err != nil {
+			return err
+		}
+		if err := other.Publish(context.Background(), segment); err != nil {
+			return err
+		}
+		return other.Release(context.Background())
+	}
+
+	restarted, _ := newTestDriverAt(t, hooked, "node-a", stateDir, clock)
+	if _, err := restarted.Mount(&volume.MountRequest{Name: "data", ID: "container"}); !errors.Is(err, replica.ErrJournalConflict) {
+		t.Fatalf("mount error = %v, want journal conflict", err)
+	}
+	if _, err := os.Stat(restarted.journalPath("data")); err != nil {
+		t.Fatalf("conflicting journal was not preserved: %v", err)
+	}
 }
 
 func TestVolumeReplicatesBlockChanges(t *testing.T) {
@@ -137,7 +353,7 @@ func TestFilesystemFlushPublishesRemoteGeneration(t *testing.T) {
 	releaseCheckpoint := func() { releaseOnce.Do(func() { close(store.release) }) }
 	t.Cleanup(releaseCheckpoint)
 	driver, backend := newTestDriver(t, store, "node-a")
-	if err := driver.Create(&volume.CreateRequest{Name: "data", Options: map[string]string{"size": "64MiB"}}); err != nil {
+	if err := driver.Create(&volume.CreateRequest{Name: "data", Options: map[string]string{"size": "64MiB", "durability": "remote"}}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := driver.Mount(&volume.MountRequest{Name: "data", ID: "container"}); err != nil {
@@ -172,10 +388,10 @@ func TestFilesystemFlushPublishesRemoteGeneration(t *testing.T) {
 	}
 }
 
-func TestAsyncDurabilityDoesNotBlockFlushOnS3(t *testing.T) {
+func TestLocalDurabilityDoesNotBlockFlushOnS3(t *testing.T) {
 	store := objectstore.NewMemory()
 	driver, backend := newTestDriver(t, store, "node-a")
-	options := map[string]string{"size": "64MiB", "durability": "async", "sync_interval": "1h"}
+	options := map[string]string{"size": "64MiB", "durability": "local", "sync_interval": "1h"}
 	if err := driver.Create(&volume.CreateRequest{Name: "data", Options: options}); err != nil {
 		t.Fatal(err)
 	}
@@ -197,7 +413,10 @@ func TestAsyncDurabilityDoesNotBlockFlushOnS3(t *testing.T) {
 		t.Fatal(err)
 	}
 	if after.Generation != before.Generation {
-		t.Fatalf("async flush advanced generation from %d to %d", before.Generation, after.Generation)
+		t.Fatalf("local flush advanced remote generation from %d to %d", before.Generation, after.Generation)
+	}
+	if _, err := os.Stat(driver.journalPath("data")); err != nil {
+		t.Fatalf("local flush did not create a durable journal: %v", err)
 	}
 	if err := driver.Unmount(&volume.UnmountRequest{Name: "data", ID: "container"}); err != nil {
 		t.Fatal(err)
@@ -207,7 +426,7 @@ func TestAsyncDurabilityDoesNotBlockFlushOnS3(t *testing.T) {
 func TestUnmountDoesNotRunGarbageCollection(t *testing.T) {
 	store := &countingListStore{Store: objectstore.NewMemory()}
 	driver, _ := newTestDriver(t, store, "node-a")
-	if err := driver.Create(&volume.CreateRequest{Name: "data", Options: map[string]string{"size": "64MiB"}}); err != nil {
+	if err := driver.Create(&volume.CreateRequest{Name: "data", Options: map[string]string{"size": "64MiB", "durability": "remote"}}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := driver.Mount(&volume.MountRequest{Name: "data", ID: "container"}); err != nil {
@@ -257,7 +476,7 @@ type failStateStore struct {
 func TestTransientRemoteFlushFailureStallsThenSucceeds(t *testing.T) {
 	store := &failStateStore{Store: objectstore.NewMemory()}
 	driver, backend := newTestDriver(t, store, "node-a")
-	if err := driver.Create(&volume.CreateRequest{Name: "data", Options: map[string]string{"size": "64MiB"}}); err != nil {
+	if err := driver.Create(&volume.CreateRequest{Name: "data", Options: map[string]string{"size": "64MiB", "durability": "remote"}}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := driver.Mount(&volume.MountRequest{Name: "data", ID: "container"}); err != nil {
@@ -342,21 +561,21 @@ func TestParseVolumeOptions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !defaults.RemoteDurability() {
-		t.Fatal("remote durability is not the default")
+	if !defaults.LocalDurability() {
+		t.Fatal("local durability is not the default")
 	}
 	opts, err := ParseVolumeOptions(map[string]string{
-		"mode": "ro", "scope": "replica", "durability": "async", "size": "2GiB", "filesystem": "ext4", "sync_interval": "2s",
+		"mode": "ro", "scope": "replica", "durability": "remote", "size": "2GiB", "filesystem": "ext4", "sync_interval": "2s",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !opts.ReadOnly() || !opts.PerReplica() || opts.RemoteDurability() || opts.Size != 2<<30 || opts.SyncInterval != 2*time.Second {
+	if !opts.ReadOnly() || !opts.PerReplica() || !opts.RemoteDurability() || opts.Size != 2<<30 || opts.SyncInterval != 2*time.Second {
 		t.Fatalf("unexpected options: %+v", opts)
 	}
 	for _, raw := range []map[string]string{
 		{"mode": "rwx"}, {"scope": "node"}, {"size": "1MiB"}, {"size": "68157441"},
-		{"filesystem": "xfs"}, {"durability": "maybe"}, {"class": "fuse"}, {"bogus": "1"}, {"mode": "ro", "seed": "/x"},
+		{"filesystem": "xfs"}, {"durability": "async"}, {"durability": "maybe"}, {"class": "fuse"}, {"bogus": "1"}, {"mode": "ro", "seed": "/x"},
 	} {
 		if _, err := ParseVolumeOptions(raw); err == nil {
 			t.Fatalf("accepted invalid options %v", raw)

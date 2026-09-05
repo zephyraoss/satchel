@@ -18,14 +18,15 @@ import (
 )
 
 type volOptions struct {
-	s3   objectstore.S3Config
-	head string
+	s3     objectstore.S3Config
+	head   string
+	settle time.Duration
 }
 
 func newVolCommand() *cobra.Command {
 	opts := volOptions{}
 	cmd := &cobra.Command{Use: "vol", Short: "Inspect and manage remote volumes"}
-	bindS3Flags(cmd, &opts.s3, &opts.head)
+	bindS3Flags(cmd, &opts.s3, &opts.head, &opts.settle)
 	cmd.PersistentFlags().AddFlagSet(cmd.Flags())
 	cmd.AddCommand(
 		newVolListCommand(&opts),
@@ -95,7 +96,7 @@ func buildRemote(opts volOptions) (*replica.Remote, error) {
 	if err != nil {
 		return nil, fmt.Errorf("--s3-head: %w", err)
 	}
-	return &replica.Remote{Store: objectstore.NewS3(opts.s3), Head: head}, nil
+	return &replica.Remote{Store: objectstore.NewS3(opts.s3), Head: head, Settle: opts.settle}, nil
 }
 
 func newVolListCommand(opts *volOptions) *cobra.Command {

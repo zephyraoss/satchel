@@ -302,7 +302,7 @@ func TestNBDFlushWaitsForPriorWrites(t *testing.T) {
 	}
 	defer device.Close()
 	payload := bytes.Repeat([]byte("w"), replica.DefaultBlockSize)
-	device.SetRemoteFlushHandler(func(generation *replica.Generation) <-chan error {
+	device.SetDurableFlushHandler(func(generation *replica.Generation) <-chan error {
 		if got := generation.Blocks[1]; !bytes.Equal(got, payload) {
 			return completedFlush(errors.New("flush generation does not contain the prior write"))
 		}
@@ -331,7 +331,7 @@ func TestNBDAllowsWritesDuringRemoteFlush(t *testing.T) {
 	defer device.Close()
 	flushStarted := make(chan struct{})
 	releaseFlush := make(chan struct{})
-	device.SetRemoteFlushHandler(func(*replica.Generation) <-chan error {
+	device.SetDurableFlushHandler(func(*replica.Generation) <-chan error {
 		result := make(chan error, 1)
 		close(flushStarted)
 		go func() {
@@ -374,7 +374,7 @@ func TestNBDKeepsFlushBarriersOrdered(t *testing.T) {
 	queued := make(chan int, 2)
 	releases := []chan struct{}{make(chan struct{}), make(chan struct{})}
 	var calls atomic.Int64
-	device.SetRemoteFlushHandler(func(*replica.Generation) <-chan error {
+	device.SetDurableFlushHandler(func(*replica.Generation) <-chan error {
 		call := int(calls.Add(1))
 		result := make(chan error, 1)
 		queued <- call
@@ -427,7 +427,7 @@ func TestNBDFUAFlushesItsWrite(t *testing.T) {
 	}
 	defer device.Close()
 	payload := bytes.Repeat([]byte("f"), replica.DefaultBlockSize)
-	device.SetRemoteFlushHandler(func(generation *replica.Generation) <-chan error {
+	device.SetDurableFlushHandler(func(generation *replica.Generation) <-chan error {
 		if got := generation.Blocks[0]; !bytes.Equal(got, payload) {
 			return completedFlush(errors.New("FUA generation does not contain its write"))
 		}

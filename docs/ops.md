@@ -58,19 +58,29 @@ Size your S3 availability against your database availability target: the
 database tolerates outages up to the lease TTL without crashing, and any longer
 outage crashes it but loses no acknowledged commit.
 
+Under `durability=local`, filesystem flushes can continue against the local
+journal during a short S3 outage. The lease still depends on S3. Satchel fences
+the volume when it can no longer prove ownership, preserves the journal, and
+requires the same node and state disk for automatic recovery. Do not move the
+volume to another node if the unpublished local branch must be retained.
+
 ## Backpressure
 
-Each write copies the affected 4 KiB blocks into an in-memory generation. Failed uploads remain queued. Satchel pauses new writes once unpublished block data reaches `--dirty-limit`, which defaults to 256 MiB. Reads continue.
+Each write copies the affected 4 KiB blocks into a generation. Failed uploads remain queued. Satchel pauses new writes once unpublished block data reaches `--dirty-limit`, which defaults to 256 MiB. Reads continue.
 
-The queue is memory-backed. In async mode, a Satchel process crash or host failure loses unpublished generations. An application process crash does not discard the queue while Satchel keeps the volume mounted. In remote mode, Satchel does not acknowledge a filesystem flush until that queue has reached S3.
+In local mode, filesystem flushes write queued generations to the persistent journal before returning. In remote mode, Satchel does not acknowledge a filesystem flush until the queue has reached S3.
 
 ## Database durability
 
-Volumes default to `durability=remote`. An ext4 flush or FUA write uploads any external segment objects, then conditionally advances `state.json` before returning success. Small manifests travel inside that state update. Satchel does not sync the disposable local image first. If S3 is unavailable, the flush fails instead of claiming the transaction is durable.
+Volumes default to `durability=local`. An ext4 flush or FUA write appends complete changed blocks to `<journal-dir>/<volume>.journal`, syncs that log, and then returns success. Satchel publishes journaled generations to S3 in the background. A successful flush survives a Satchel crash and a same-node reboot, but it does not survive loss of the journal disk until S3 publication finishes.
+
+After a crash, Satchel restores the current S3 image and replays committed journal records. It marks records reclaimable only after S3 advances the volume head, then compacts them in batches. If another writer advanced the remote history, the mount fails and leaves the journal untouched. An operator must choose which branch to keep.
+
+With `durability=remote`, an ext4 flush or FUA write uploads any external segment objects, then conditionally advances `state.json` before returning success. Small manifests travel inside that state update. Satchel does not sync the disposable local image first. If S3 is unavailable, the flush waits until S3 recovers or lease loss fences the volume.
 
 Small database commits need one durable S3 request: the fenced `state.json` update. Once inline history reaches 16 KiB, Satchel starts an immutable bundle upload in the background and installs its pointer in a later state update. The inline area has a 64 KiB hard limit. Commits with external segments or a full inline area still use an upload phase followed by the state update. Ordinary reads and writes use the local block device. Put S3 in the same low-latency region when using this mode.
 
-Set `durability=async` only when lower commit latency is worth weaker local durability. Filesystem flushes do not sync the disposable local image or wait for S3. Replication runs on the configured interval, wakes early as the unpublished-data limit fills, and applies backpressure at that limit. A PostgreSQL crash leaves the mounted image and queue intact because Satchel is still running. A Satchel crash, forced restart, or host failure can lose every generation that has not advanced `state.json`. Satchel rebuilds from S3 after a restart and never treats the local image as recovery state.
+Replication in local mode runs on the configured interval, wakes early as the unpublished-data limit fills, and applies backpressure at that limit. The sparse image remains a disposable cache. Only the journal and published S3 generations participate in recovery.
 
 ## Checkpoints
 
@@ -80,7 +90,14 @@ Checkpoint parent links retain point-in-time history. `satchel vol restore` acce
 
 ## Local state
 
-`<state-dir>/volumes` contains the local Docker registry. `<state-dir>/images` contains sparse images while mounted. `<state-dir>/mounts` contains ext4 mountpoints. Images are disposable and Satchel removes them after a clean unmount.
+`<state-dir>/volumes` contains the local Docker registry. `<journal-dir>` contains locally durable generations that have not reached S3 and defaults to `<state-dir>/journals`. Put it on low-latency persistent storage. `<state-dir>/images` contains sparse images while mounted. `<state-dir>/mounts` contains ext4 mountpoints. Images are disposable and Satchel removes them after a clean unmount. Clean unmount publishes all journaled data and removes the journal.
+
+On btrfs, create an empty journal directory with NOCOW before Satchel writes its first journal. Satchel journals have their own SHA-256 checksums, so they do not depend on btrfs data checksums:
+
+```sh
+sudo install -d -m 0700 /var/lib/satchel/journals
+sudo chattr +C /var/lib/satchel/journals
+```
 
 An existing writable volume mounts after Satchel reads its manifest chain. Segment bodies arrive on the first block read and remain in the sparse local image for the life of the mount. A cold read can therefore include one S3 GET and decompression of up to 4 MiB of block data. Full-block writes do not fetch the prior remote block. Partial-block writes do. Read-only mounts materialize their fixed snapshot before mounting because they do not hold a lease that can pin old objects against garbage collection.
 

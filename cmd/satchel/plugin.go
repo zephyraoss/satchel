@@ -27,6 +27,7 @@ import (
 type pluginOptions struct {
 	nodeID             string
 	stateDir           string
+	journalDir         string
 	socketName         string
 	metricsAddr        string
 	leaseTTL           time.Duration
@@ -36,6 +37,7 @@ type pluginOptions struct {
 	gcGrace            time.Duration
 	s3                 objectstore.S3Config
 	s3Head             string
+	s3Settle           time.Duration
 	logLevel           string
 	dirtyLimit         string
 }
@@ -58,6 +60,7 @@ func bindPluginFlags(cmd *cobra.Command, opts *pluginOptions) {
 	f := cmd.Flags()
 	f.StringVar(&opts.nodeID, "node-id", envOr("SATCHEL_NODE_ID", hostname), "identifier recorded in leases held by this node")
 	f.StringVar(&opts.stateDir, "state-dir", envOr("SATCHEL_STATE_DIR", "/var/lib/satchel"), "local state directory")
+	f.StringVar(&opts.journalDir, "journal-dir", envOr("SATCHEL_JOURNAL_DIR", ""), "durable journal directory (default: <state-dir>/journals)")
 	f.StringVar(&opts.socketName, "socket", envOr("SATCHEL_SOCKET", "satchel"), "plugin socket name under /run/docker/plugins")
 	f.StringVar(&opts.metricsAddr, "metrics-addr", envOr("SATCHEL_METRICS_ADDR", ""), "address for the Prometheus /metrics endpoint (empty disables)")
 	f.DurationVar(&opts.leaseTTL, "lease-ttl", envDurationOr("SATCHEL_LEASE_TTL", 30*time.Second), "lease TTL; heartbeat runs every ttl/3")
@@ -65,14 +68,15 @@ func bindPluginFlags(cmd *cobra.Command, opts *pluginOptions) {
 	f.Uint64Var(&opts.checkpointInterval, "checkpoint-interval", envUint64Or("SATCHEL_CHECKPOINT_INTERVAL", 128), "compact the restore chain after this many generations")
 	f.DurationVar(&opts.historyRetention, "history-retention", envDurationOr("SATCHEL_HISTORY_RETENTION", 7*24*time.Hour), "retain point-in-time generations for at least this long")
 	f.DurationVar(&opts.gcGrace, "gc-grace", envDurationOr("SATCHEL_GC_GRACE", 24*time.Hour), "wait this long before deleting unreachable objects")
-	bindS3Flags(cmd, &opts.s3, &opts.s3Head)
+	bindS3Flags(cmd, &opts.s3, &opts.s3Head, &opts.s3Settle)
 	f.StringVar(&opts.logLevel, "log-level", envOr("SATCHEL_LOG_LEVEL", "info"), "debug|info|warn|error")
 	f.StringVar(&opts.dirtyLimit, "dirty-limit", envOr("SATCHEL_DIRTY_LIMIT", "256MiB"), "pause writes when unpublished block generations exceed this size")
 }
 
-func bindS3Flags(cmd *cobra.Command, opts *objectstore.S3Config, head *string) {
+func bindS3Flags(cmd *cobra.Command, opts *objectstore.S3Config, head *string, settle *time.Duration) {
 	f := cmd.Flags()
 	f.StringVar(head, "s3-head", envOr("SATCHEL_S3_HEAD", string(replica.ConditionalHead)), "volume head protocol: conditional (If-Match, AWS/MinIO/R2) or append (listing-based, Garage)")
+	f.DurationVar(settle, "s3-settle", envDurationOr("SATCHEL_S3_SETTLE", replica.DefaultSettle), "append head settle window; claims slower than half of it are discarded, so size it to several S3 round-trips")
 	f.StringVar(&opts.Endpoint, "s3-endpoint", envOr("SATCHEL_S3_ENDPOINT", ""), "S3 endpoint URL (empty for AWS)")
 	f.StringVar(&opts.Region, "s3-region", envOr("SATCHEL_S3_REGION", "us-east-1"), "S3 region")
 	f.StringVar(&opts.Bucket, "s3-bucket", envOr("SATCHEL_S3_BUCKET", ""), "S3 bucket holding volumes and leases")
@@ -130,7 +134,7 @@ func buildDriver(ctx context.Context, opts pluginOptions) (*plugin.Driver, *slog
 	}
 	store := objectstore.NewS3(opts.s3)
 	remote := &replica.Remote{
-		Store: store, Head: headMode, TTL: opts.leaseTTL,
+		Store: store, Head: headMode, TTL: opts.leaseTTL, Settle: opts.s3Settle,
 		Observe: func(stage string, duration time.Duration) {
 			metrics.ReplicationStageDuration.WithLabelValues(stage).Observe(duration.Seconds())
 		},
@@ -154,7 +158,7 @@ func buildDriver(ctx context.Context, opts pluginOptions) (*plugin.Driver, *slog
 	}
 	driver, err := plugin.New(
 		plugin.Config{
-			NodeID: opts.nodeID, StateDir: opts.stateDir, MaxDirty: dirtyLimit,
+			NodeID: opts.nodeID, StateDir: opts.stateDir, JournalDir: opts.journalDir, MaxDirty: dirtyLimit,
 			SyncInterval: opts.syncInterval, CheckpointInterval: opts.checkpointInterval,
 			HistoryRetention: opts.historyRetention, GCGrace: opts.gcGrace,
 			Logger: logger, Seeder: &seed.Seeder{Fetch: store.Fetch},

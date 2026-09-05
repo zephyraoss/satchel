@@ -87,7 +87,7 @@ func TestVolumeMovesBetweenNodes(t *testing.T) {
 		return driver
 	}
 	first := node("node-a")
-	if err := first.Create(&volume.CreateRequest{Name: name, Options: map[string]string{"size": "64MiB", "sync_interval": "1h"}}); err != nil {
+	if err := first.Create(&volume.CreateRequest{Name: name, Options: map[string]string{"size": "64MiB", "durability": "remote", "sync_interval": "1h"}}); err != nil {
 		t.Fatal(err)
 	}
 	mounted, err := first.Mount(&volume.MountRequest{Name: name, ID: "writer-a"})
@@ -210,7 +210,7 @@ func TestConcurrentWriterIsFencedAfterTakeover(t *testing.T) {
 	inspect := e2eRemote(t, store, 0)
 
 	nodeA := node("node-a")
-	if err := nodeA.Create(&volume.CreateRequest{Name: name, Options: map[string]string{"size": "64MiB"}}); err != nil {
+	if err := nodeA.Create(&volume.CreateRequest{Name: name, Options: map[string]string{"size": "64MiB", "durability": "remote"}}); err != nil {
 		t.Fatal(err)
 	}
 	mountA, err := nodeA.Mount(&volume.MountRequest{Name: name, ID: "writer-a"})
@@ -230,7 +230,7 @@ func TestConcurrentWriterIsFencedAfterTakeover(t *testing.T) {
 		t.Fatalf("node A did not publish under a held lease: %+v", held)
 	}
 
-	// Wait out node A's trailing async checkpoint so the conditional break does
+	// Wait out node A's trailing background checkpoint so the conditional break does
 	// not race a concurrent state update; operators are likewise told to
 	// quiesce the holder before breaking its lease.
 	deadline := time.Now().Add(30 * time.Second)
@@ -409,7 +409,7 @@ func TestPartitionedWriterSelfFencesAndYields(t *testing.T) {
 
 	partitioned := &partitionableStore{Store: rawStore}
 	nodeA := node("node-a", partitioned)
-	if err := nodeA.Create(&volume.CreateRequest{Name: name, Options: map[string]string{"size": "64MiB"}}); err != nil {
+	if err := nodeA.Create(&volume.CreateRequest{Name: name, Options: map[string]string{"size": "64MiB", "durability": "remote"}}); err != nil {
 		t.Fatal(err)
 	}
 	mountA, err := nodeA.Mount(&volume.MountRequest{Name: name, ID: "writer-a"})
@@ -593,7 +593,7 @@ func TestSimultaneousMountRaceAdmitsExactlyOneWriter(t *testing.T) {
 
 	nodeA, nodeB := node("node-a"), node("node-b")
 	for id, driver := range map[string]*plugin.Driver{"node-a": nodeA, "node-b": nodeB} {
-		if err := driver.Create(&volume.CreateRequest{Name: name, Options: map[string]string{"size": "64MiB"}}); err != nil {
+		if err := driver.Create(&volume.CreateRequest{Name: name, Options: map[string]string{"size": "64MiB", "durability": "remote"}}); err != nil {
 			t.Fatalf("create on %s: %v", id, err)
 		}
 	}

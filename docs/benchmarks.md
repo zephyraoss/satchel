@@ -4,10 +4,11 @@ These results compare the last SQLite and Litestream revision, the first block
 revision, and the current Satchel Block implementation.
 
 They are development-machine results, not production sizing guidance. Each
-number is one 10-second fio sample. The tests use `durability=async`, so they
-measure filesystem throughput while replication runs in the background. They
-do not measure database commit latency with S3-backed durability. PostgreSQL
-results appear after the fio sections.
+number is one 10-second fio sample. The recorded tests used the former unsafe
+async mode, which did not sync local or remote storage before acknowledging a
+flush. Satchel no longer exposes that mode. These numbers are retained as a
+write-path ceiling, not as results for the current locally durable default.
+PostgreSQL results appear after the fio sections.
 
 ## Test machine
 
@@ -30,7 +31,7 @@ reads and 30% writes with 4 KiB operations.
 
 This is the full `test/bench/run.sh` suite with a one-second sync interval and
 the default 256 MiB unpublished-data limit. Every implementation used the same
-local MinIO endpoint. Satchel Block used asynchronous durability.
+local MinIO endpoint. Satchel Block used the former unsafe async mode.
 
 | Workload | SQLite and Litestream | Initial block | Satchel Block | Block vs SQLite |
 |---|---:|---:|---:|---:|
@@ -118,26 +119,25 @@ SATCHEL_S3_BUCKET=satchel \
 SATCHEL_S3_ACCESS_KEY=minioadmin \
 SATCHEL_S3_SECRET_KEY=minioadmin \
 SATCHEL_SYNC_INTERVAL=1s \
-SATCHEL_DURABILITY=async \
+SATCHEL_DURABILITY=local \
 FIO_RUNTIME=10 \
 FIO_SIZE=256M \
 FIO_DIRECT=0 \
 ./test/bench/run.sh
 ```
 
-For database durability, rerun with `SATCHEL_DURABILITY=remote` and a workload
-that calls `fsync` for each transaction. Record p50, p95, and p99 commit
-latency. That result depends mainly on S3 request latency, so use the same S3
-placement that production will use.
+The command now measures local journal durability and will not reproduce the
+historical table above. Rerun with `SATCHEL_DURABILITY=remote` to measure
+node-loss durability. Record p50, p95, and p99 commit latency.
 
 ## PostgreSQL on the benchmark host
 
 These results use a dedicated benchmark host with 4 vCPUs, 8 GiB RAM, and one
 100 GiB btrfs filesystem using zstd compression. Each mode used a separately
 initialized scale-100 database. The native control ran on 2026-09-01 UTC. The
-async control and final remote run ran on 2026-09-02 UTC. The final remote run
-started at 01:30:59 and finished at 01:38:05. The benchmark harness also writes
-its exact UTC start and finish times to `environment.txt`. MinIO
+legacy async control and final remote run ran on 2026-09-02 UTC. The final
+remote run started at 01:30:59 and finished at 01:38:05. The benchmark harness
+also writes its exact UTC start and finish times to `environment.txt`. MinIO
 `RELEASE.2025-09-07T16-13-09Z` used the same disk and the loopback interface.
 Remote latency is optimistic for networking, while its disk contention is
 worse than a separate S3 service.
@@ -145,19 +145,44 @@ worse than a separate S3 service.
 The host exposes one SSD-backed virtual disk, not NVMe. Its native one-client
 result was 55 TPS, so the native column is a same-host control, not a general
 SSD or NVMe estimate. On storage capable of 1,000 or more durable commits per
-second, native and async may be much closer. Do not use these large ratios as
-general product claims.
+second, native and the legacy async result may be much closer. Do not use these
+large ratios as general product claims.
 
 The block runs used separate 20 GiB scale-100 volumes. The native control used
 an equivalent freshly initialized scale-100 data directory. PostgreSQL 18.4
 enabled data checksums, `fsync`, synchronous commits, and full-page writes. It
 used 1 GiB shared buffers. pgbench used prepared statements, a 30-second
-warmup, a 60-second measured run, and a 10% latency sample. Satchel used a
-one-second sync interval, a 2 GiB unpublished-data limit, and a 128-generation
-checkpoint interval. The async rows used binary SHA-256
+warmup, a 60-second measured run, and a 10% latency sample. Satchel used a 2 GiB
+unpublished-data limit and a 128-generation checkpoint interval. The legacy
+async and remote rows used a one-second sync interval. The legacy async rows
+used binary SHA-256
 `b16f6a782af4f62ee61536427fe3ef1a91522f111e11ea809dd47f09df5b8cac`.
 The remote rows used
 `5e01914f919da202004d11b25f1abcb98fb8e20d226c8d3460bce99843922028`.
+
+### Local journal durability
+
+The locally durable candidate ran on 2026-09-04 UTC against its previously
+initialized scale-100 volume, with the same PostgreSQL and pgbench settings.
+Its journal used a persistent btrfs NOCOW directory, S3 publication used the
+default five-second interval, and the candidate binary was
+`1a72bbfbde21842486e266878cc634a04a3392c9f7e923b1fd0cd17de71ab28b`.
+The run passed PostgreSQL crash recovery, a restore from S3, and `pg_amcheck`.
+
+| Clients | Local TPS | Average ms | p50 ms | p95 ms | p99 ms | Old async TPS |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 75.094 | 13.315 | 11.320 | 24.359 | 50.172 | 1,516.639 |
+| 8 | 309.596 | 25.827 | 22.666 | 41.643 | 73.663 | 3,912.648 |
+| 32 | 856.229 | 37.312 | 26.251 | 82.230 | 132.409 | 3,431.157 |
+
+Local durability retained 5.0%, 7.9%, and 25.0% of unsafe async throughput at
+1, 8, and 32 clients. The same host's native PostgreSQL control measured
+55.386, 231.561, and 790.205 TPS. Satchel local exceeded native throughput by
+8% to 36% at the tested concurrency levels. The result is limited by the host's
+durable-write latency: a 4 KiB journal record and `fdatasync` measured 12.74 ms
+on the NOCOW directory and 15.67 ms on the default compressed btrfs directory.
+With four concurrent callers, journal batching reduced the sync rate to 0.30
+syncs per operation and delivered 242 durable operations per second.
 
 | Mode | Clients | TPS | Average ms | p50 ms | p95 ms | p99 ms |
 |---|---:|---:|---:|---:|---:|---:|
@@ -171,10 +196,11 @@ The remote rows used
 | async | 32 | 3,431.157 | 9.277 | 5.804 | 28.991 | 59.498 |
 | remote | 32 | 206.489 | 154.663 | 128.852 | 305.388 | 396.184 |
 
-Async delivered 27.4, 16.9, and 4.34 times native throughput at the three
-client counts because it does not wait for local or remote stable storage. A
-PostgreSQL crash leaves the mounted image intact. A Satchel crash, forced
-restart, or host failure can lose every generation not yet published to S3.
+The removed async mode delivered 27.4, 16.9, and 4.34 times native throughput
+at the three client counts because it does not wait for local or remote stable
+storage. A PostgreSQL crash leaves the mounted image intact. A Satchel crash,
+forced restart, or host failure can lose every generation not yet published to
+S3.
 The expected window is about one second with this configuration, but an S3
 outage can make it longer until the dirty-data limit stops writers.
 
@@ -182,7 +208,7 @@ A separate fresh scale-10 diagnostic at 32 clients measured 6,244.60 TPS with
 the serial NBD path, 6,445.14 TPS with an eight-request queue, and 5,953.75 TPS
 with a 64-request queue. Shallow request parallelism gained 3.2%, while the
 deeper queue regressed 4.7% through lock contention. Satchel therefore keeps
-the serial path for async durability. The lower scale-100 result includes the
+the serial path for the old async mode. The lower scale-100 result includes the
 cost of capturing, compressing, and uploading a much larger working set every
 second; it is not a fixed NBD throughput ceiling.
 
@@ -267,13 +293,13 @@ one object, and restored every segment before mounting.
 | remote | 8 | 42.152 | 73.266 | 1.74x | 175.563 | 102.129 |
 | remote | 32 | 143.091 | 206.489 | 1.44x | 182.012 | 128.852 |
 
-The async gain comes mainly from removing `fdatasync` on the disposable image.
-Remote gained from embedding compressed segments up to 64 KiB in the manifest,
-parallel work for larger generations, lower S3 request overhead, batching
-flush generations that are already waiting, and carrying small manifests in
-the conditional head update. The final code keeps immutable historical
-manifests and a conditional head, so acknowledged commits do not rely on the
-disposable local image.
+The legacy async gain came mainly from removing `fdatasync` on the disposable
+image. Remote gained from embedding compressed segments up to 64 KiB in the
+manifest, parallel work for larger generations, lower S3 request overhead,
+batching flush generations that are already waiting, and carrying small
+manifests in the conditional head update. The final code keeps immutable
+historical manifests and a conditional head. Acknowledged commits do not rely
+on the disposable local image.
 
 Every reported run processed zero failed transactions and passed PostgreSQL's
 immediate-stop recovery check. Both block modes then unmounted, restored lazily

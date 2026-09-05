@@ -32,6 +32,7 @@ var ErrVolumeNotFound = errors.New("volume not found")
 type Config struct {
 	NodeID             string
 	StateDir           string
+	JournalDir         string
 	MaxDirty           int64
 	SyncInterval       time.Duration
 	CheckpointInterval uint64
@@ -71,6 +72,7 @@ type mountState struct {
 	device    *replica.Device
 	unmounter backend.Unmounter
 	syncer    *replica.Syncer
+	journal   *replica.Journal
 	stopBeat  context.CancelFunc
 	fenced    error
 }
@@ -100,11 +102,17 @@ func New(cfg Config, remote *replica.Remote, be backend.Backend) (*Driver, error
 	if be == nil {
 		return nil, errors.New("block backend is required")
 	}
+	if cfg.JournalDir == "" {
+		cfg.JournalDir = filepath.Join(cfg.StateDir, "journals")
+	}
 	d := &Driver{cfg: cfg, remote: remote, backend: be, log: cfg.Logger, volumes: map[string]*volumeState{}}
 	for _, sub := range []string{"volumes", "images", "mounts"} {
 		if err := os.MkdirAll(filepath.Join(cfg.StateDir, sub), 0o700); err != nil {
 			return nil, err
 		}
+	}
+	if err := os.MkdirAll(cfg.JournalDir, 0o700); err != nil {
+		return nil, err
 	}
 	if err := d.loadRegistry(); err != nil {
 		return nil, err
@@ -118,6 +126,10 @@ func (d *Driver) registryPath(name string) string {
 
 func (d *Driver) imagePath(name string) string {
 	return filepath.Join(d.cfg.StateDir, "images", name+".img")
+}
+
+func (d *Driver) journalPath(name string) string {
+	return filepath.Join(d.cfg.JournalDir, name+".journal")
 }
 
 func (d *Driver) mountpoint(name string) string {
@@ -137,6 +149,9 @@ func (d *Driver) loadRegistry() error {
 		var record volumeRecord
 		if err := json.Unmarshal(data, &record); err != nil {
 			return fmt.Errorf("corrupt registry entry %s: %w", entry.Name(), err)
+		}
+		if record.Options.Durability != "local" && record.Options.Durability != "remote" {
+			return fmt.Errorf("registry entry %s uses unsupported durability %q", entry.Name(), record.Options.Durability)
 		}
 		d.volumes[record.Name] = newState(record)
 	}
@@ -287,8 +302,10 @@ func (d *Driver) Remove(req *volume.RemoveRequest) error {
 	}
 	for name := range state.mounts {
 		d.cleanupLocal(name)
+		_ = os.Remove(d.journalPath(name))
 	}
 	d.cleanupLocal(req.Name)
+	_ = os.Remove(d.journalPath(req.Name))
 	if err := os.Remove(d.registryPath(req.Name)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
@@ -353,8 +370,40 @@ func (d *Driver) mountFresh(ctx context.Context, state *volumeState, mount *moun
 		return d.mountReadOnly(ctx, mount)
 	}
 	opts := state.record.Options
+	var journal *replica.Journal
+	var recovered []*replica.Generation
+	var err error
+	if opts.LocalDurability() {
+		journal, err = replica.OpenJournal(d.journalPath(mount.name))
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("open local journal: %w", err)
+		}
+		if journal != nil {
+			recovered = journal.Entries()
+			if len(recovered) == 0 {
+				if closeErr := journal.Close(true); closeErr != nil {
+					return fmt.Errorf("remove empty local journal: %w", closeErr)
+				}
+				journal = nil
+			}
+		}
+		if journal != nil {
+			remoteState, _, inspectErr := d.remote.Inspect(ctx, mount.name)
+			if inspectErr != nil {
+				_ = journal.Close(false)
+				return fmt.Errorf("inspect remote state for local journal recovery: %w", inspectErr)
+			}
+			if validateErr := journal.ValidateRecovery(remoteState); validateErr != nil {
+				_ = journal.Close(false)
+				return fmt.Errorf("recover local journal %s: %w", d.journalPath(mount.name), validateErr)
+			}
+		}
+	}
 	lease, _, err := d.remote.Acquire(ctx, mount.name, d.cfg.NodeID, replica.CreateOptions{Size: opts.Size, Filesystem: opts.Filesystem})
 	if err != nil {
+		if journal != nil {
+			_ = journal.Close(false)
+		}
 		metrics.MountFailures.WithLabelValues("lease").Inc()
 		return err
 	}
@@ -367,6 +416,9 @@ func (d *Driver) mountFresh(ctx context.Context, state *volumeState, mount *moun
 	})
 	releaseOnFailure := func(cause error) error {
 		stopBeat()
+		if journal != nil {
+			_ = journal.Close(false)
+		}
 		d.cleanupLocal(mount.name)
 		if err := lease.Release(context.WithoutCancel(ctx)); err != nil {
 			d.log.Error("release lease after failed mount", "volume", mount.name, "err", err)
@@ -376,6 +428,14 @@ func (d *Driver) mountFresh(ctx context.Context, state *volumeState, mount *moun
 	d.cleanupLocal(mount.name)
 	imagePath := d.imagePath(mount.name)
 	remoteState := lease.State()
+	if journal != nil {
+		if err := journal.ValidateRecovery(remoteState); err != nil {
+			return releaseOnFailure(fmt.Errorf("revalidate local journal after lease acquisition: %w", err))
+		}
+		if err := journal.Rebase(remoteState); err != nil {
+			return releaseOnFailure(fmt.Errorf("adopt local journal: %w", err))
+		}
+	}
 	initializing := remoteState.Generation == 0
 	started := time.Now()
 	var lazyImage *replica.LazyImage
@@ -409,6 +469,15 @@ func (d *Driver) mountFresh(ctx context.Context, state *volumeState, mount *moun
 		return releaseOnFailure(err)
 	}
 	device.SetLazyImage(lazyImage)
+	device.SetDirtyObserver(func(bytes int64) {
+		metrics.UnpublishedBytes.WithLabelValues(mount.name).Set(float64(bytes))
+	})
+	if len(recovered) > 0 {
+		if err := device.Replay(recovered); err != nil {
+			device.Close()
+			return releaseOnFailure(fmt.Errorf("replay local journal: %w", err))
+		}
+	}
 	device.SetBackpressureHandler(func() {
 		metrics.BackpressureEvents.WithLabelValues(mount.name).Inc()
 	})
@@ -427,7 +496,7 @@ func (d *Driver) mountFresh(ctx context.Context, state *volumeState, mount *moun
 	cleanupMounted := func(cause error) error {
 		_ = unmounter.Abandon()
 		_ = device.Close()
-		mount.active, mount.lease, mount.device, mount.unmounter, mount.syncer, mount.stopBeat = false, nil, nil, nil, nil, nil
+		mount.active, mount.lease, mount.device, mount.unmounter, mount.syncer, mount.journal, mount.stopBeat = false, nil, nil, nil, nil, nil, nil
 		return releaseOnFailure(cause)
 	}
 	if opts.Seed != "" && initializing {
@@ -449,27 +518,34 @@ func (d *Driver) mountFresh(ctx context.Context, state *volumeState, mount *moun
 		}
 		device.Release(generation)
 	}
+	if opts.LocalDurability() && journal == nil {
+		journal, err = replica.CreateJournal(d.journalPath(mount.name), lease.State())
+		if err != nil {
+			return cleanupMounted(fmt.Errorf("create local journal: %w", err))
+		}
+	}
 	interval := opts.SyncInterval
 	if interval == 0 {
 		interval = d.cfg.SyncInterval
 	}
 	syncer := replica.StartSyncer(device, lease, interval, d.cfg.CheckpointInterval, d.log.With("volume", mount.name), func(cause error) {
 		go d.fence(state, mount, cause)
-	})
-	mount.syncer = syncer
+	}, journal)
+	mount.syncer, mount.journal = syncer, journal
 	dirtyThreshold := min(d.cfg.MaxDirty/4, int64(32<<20))
 	device.SetDirtyHandler(dirtyThreshold, syncer.Notify)
 	device.SetBackpressureHandler(func() {
 		metrics.BackpressureEvents.WithLabelValues(mount.name).Inc()
 		syncer.Notify()
 	})
-	device.SetDirtyObserver(func(bytes int64) {
-		metrics.UnpublishedBytes.WithLabelValues(mount.name).Set(float64(bytes))
-	})
 	if opts.RemoteDurability() {
-		device.SetRemoteFlushHandler(syncer.EnqueueGeneration)
+		device.SetDurableFlushHandler(syncer.EnqueueGeneration)
 	} else {
-		device.SetAsyncFlush()
+		device.SetDurableFlushHandler(syncer.EnqueueLocalGeneration)
+		if len(recovered) > 0 {
+			syncer.EnqueueRecovered(recovered)
+			syncer.Notify()
+		}
 	}
 	metrics.LeaseHeld.WithLabelValues(mount.name).Set(1)
 	d.log.Info("volume mounted", "volume", mount.name, "restore_took", time.Since(started))
@@ -515,6 +591,9 @@ func (d *Driver) fence(state *volumeState, mount *mountState, cause error) {
 	if mount.syncer != nil {
 		mount.syncer.Abandon()
 	}
+	if mount.journal != nil {
+		_ = mount.journal.Close(false)
+	}
 	if mount.stopBeat != nil {
 		mount.stopBeat()
 	}
@@ -525,7 +604,7 @@ func (d *Driver) fence(state *volumeState, mount *mountState, cause error) {
 		_ = mount.device.Close()
 	}
 	d.cleanupLocal(mount.name)
-	mount.active, mount.lease, mount.device, mount.unmounter, mount.syncer, mount.stopBeat = false, nil, nil, nil, nil, nil
+	mount.active, mount.lease, mount.device, mount.unmounter, mount.syncer, mount.journal, mount.stopBeat = false, nil, nil, nil, nil, nil, nil
 	mount.fenced = cause
 	metrics.MountedVolumes.Dec()
 	metrics.UnpublishedBytes.DeleteLabelValues(mount.name)
@@ -572,10 +651,15 @@ func (d *Driver) unmountLast(ctx context.Context, mount *mountState) error {
 	if err := mount.device.Close(); err != nil {
 		return err
 	}
+	if mount.journal != nil {
+		if err := mount.journal.Close(true); err != nil {
+			return err
+		}
+	}
 	metrics.MountedVolumes.Dec()
 	metrics.UnpublishedBytes.DeleteLabelValues(mount.name)
 	d.cleanupLocal(mount.name)
-	mount.active, mount.lease, mount.device, mount.unmounter, mount.syncer, mount.stopBeat = false, nil, nil, nil, nil, nil
+	mount.active, mount.lease, mount.device, mount.unmounter, mount.syncer, mount.journal, mount.stopBeat = false, nil, nil, nil, nil, nil, nil
 	return nil
 }
 
@@ -584,6 +668,9 @@ func (d *Driver) abandonUnmounted(mount *mountState, cause error) error {
 	metrics.MountFailures.WithLabelValues("final_sync").Inc()
 	if mount.syncer != nil {
 		mount.syncer.Abandon()
+	}
+	if mount.journal != nil {
+		_ = mount.journal.Close(false)
 	}
 	if mount.stopBeat != nil {
 		mount.stopBeat()
@@ -600,7 +687,7 @@ func (d *Driver) abandonUnmounted(mount *mountState, cause error) error {
 	metrics.MountedVolumes.Dec()
 	metrics.UnpublishedBytes.DeleteLabelValues(mount.name)
 	d.cleanupLocal(mount.name)
-	mount.active, mount.lease, mount.device, mount.unmounter, mount.syncer, mount.stopBeat = false, nil, nil, nil, nil, nil
+	mount.active, mount.lease, mount.device, mount.unmounter, mount.syncer, mount.journal, mount.stopBeat = false, nil, nil, nil, nil, nil, nil
 	return cause
 }
 

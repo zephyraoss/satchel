@@ -30,11 +30,13 @@
   },
   "mounts": [
     { "source": "/var/lib/satchel/volumes", "destination": "/var/lib/satchel/volumes", "type": "bind", "options": ["rbind"] },
-    { "source": "/var/lib/satchel/images", "destination": "/var/lib/satchel/images", "type": "bind", "options": ["rbind"] }
+    { "source": "/var/lib/satchel/images", "destination": "/var/lib/satchel/images", "type": "bind", "options": ["rbind"] },
+    { "source": "/var/lib/satchel/journals", "destination": "/var/lib/satchel/journals", "type": "bind", "options": ["rbind"] }
   ],
   "propagatedmount": "/var/lib/satchel/mounts",
   "env": [
     { "name": "SATCHEL_NODE_ID", "settable": ["value"] },
+    { "name": "SATCHEL_JOURNAL_DIR", "settable": ["value"], "value": "/var/lib/satchel/journals" },
     { "name": "SATCHEL_S3_ENDPOINT", "settable": ["value"] },
     { "name": "SATCHEL_S3_REGION", "settable": ["value"], "value": "us-east-1" },
     { "name": "SATCHEL_S3_BUCKET", "settable": ["value"] },
@@ -42,6 +44,7 @@
     { "name": "SATCHEL_S3_SECRET_KEY", "settable": ["value"] },
     { "name": "SATCHEL_S3_PATH_STYLE", "settable": ["value"], "value": "true" },
     { "name": "SATCHEL_S3_HEAD", "settable": ["value"], "value": "conditional" },
+    { "name": "SATCHEL_S3_SETTLE", "settable": ["value"], "value": "3s" },
     { "name": "SATCHEL_LEASE_TTL", "settable": ["value"], "value": "30s" },
     { "name": "SATCHEL_SYNC_INTERVAL", "settable": ["value"], "value": "5s" },
     { "name": "SATCHEL_DIRTY_LIMIT", "settable": ["value"], "value": "256MiB" },

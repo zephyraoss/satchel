@@ -16,13 +16,10 @@ stronger claim than "passed a pgbench run", because engines differ in the two
 things that stress this design.
 
 - **Flush discipline.** Satchel's durability contract is an ext4 flush or FUA
-  write. An engine that fsyncs its journal on every commit (PostgreSQL with
-  `synchronous_commit=on`, MySQL/InnoDB with
-  `innodb_flush_log_at_trx_commit=1`) exercises the remote-durability path on
-  the commit critical path. An engine that batches or defers fsync (MongoDB's
-  journal at 100 ms, MySQL with the flush setting relaxed) shifts the exposure
-  window. Each supported engine needs its own crash-consistency and durability
-  proof, not an inherited one.
+  write. The default local mode syncs Satchel's redo journal on that path. The
+  remote mode advances the S3 head instead. An engine that batches or defers
+  fsync shifts its own exposure window. Each supported engine needs its own
+  crash-consistency and durability proof, not an inherited one.
 - **Working-set shape.** pgbench writes small scattered 4 KiB pages. An engine
   with a large sequential WAL, big compactions (RocksDB/LSM engines like MongoDB
   WiredTiger, Cassandra), or 16 KiB+ pages produces different generation sizes,
@@ -116,6 +113,13 @@ proves, each time, that acknowledged commits survive and the filesystem is
 consistent. `test/fault/crashloop.sh` is the seed. It already rotates through
 four faults with per-cycle verification (acked-commit ledger, pgbench
 balance/history invariant, `pg_amcheck`):
+
+The existing campaign runs with `durability=remote`. The local default also
+needs a same-node campaign that kills Satchel after an acknowledged flush but
+before S3 publication, reboots the host, truncates the final journal record at
+every byte boundary, and kills journal compaction around its rename. A takeover
+test must confirm that Satchel preserves and rejects a divergent journal rather
+than replaying it over another writer's history.
 
 - `kill -9` of PostgreSQL, then crash recovery on the still-mounted volume.
 - `kill -9` of Satchel, lease broken via `vol lease break --yes`, takeover mount

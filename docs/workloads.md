@@ -2,9 +2,11 @@
 
 Satchel now exposes ext4, so applications receive normal Linux filesystem behavior. Databases no longer run through a second filesystem implemented as SQLite rows.
 
-The default `durability=remote` mode publishes dirty blocks to S3 before an ext4 flush succeeds. Databases that use `fsync` correctly do not lose acknowledged transactions when a node fails. S3 latency becomes part of commit latency, so a database's own replication is still the better choice when it needs low-latency synchronous commits or automatic multi-node failover.
+The default `durability=local` mode writes dirty blocks to Satchel's local journal before an ext4 flush succeeds. S3 replication runs on the configured interval. A database that uses `fsync` correctly recovers acknowledged transactions after an application crash, Satchel crash, or same-node reboot as long as the state disk survives.
 
-`durability=async` acknowledges filesystem flushes without syncing the disposable local image and publishes on the configured interval. An application crash retains writes while Satchel keeps the volume mounted. A Satchel crash, forced restart, or host failure can lose unpublished generations because restart rebuilds from S3. The dirty-data limit bounds unpublished bytes and pauses writers if S3 cannot keep up.
+`durability=remote` publishes dirty blocks to S3 before an ext4 flush succeeds. It preserves acknowledged transactions after loss of the node or its disk. S3 latency becomes part of commit latency, so a database's own replication is still the better choice when it needs low-latency synchronous commits or automatic multi-node failover.
+
+Local durability does not make unpublished writes portable. If another node advances the remote history, Satchel preserves the old node's journal and refuses to replay it automatically. The dirty-data limit bounds unpublished bytes and pauses writers if S3 cannot keep up.
 
 Good fits include application state, uploads, caches, development databases, and services that accept a small recovery-point window.
 

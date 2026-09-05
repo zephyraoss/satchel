@@ -6,7 +6,7 @@ set -euo pipefail
 : "${SATCHEL_S3_SECRET_KEY:=minioadmin}"
 : "${SATCHEL_STATE_DIR:=/tmp/satchel-bench}"
 : "${SATCHEL_SYNC_INTERVAL:=1s}"
-: "${SATCHEL_DURABILITY:=async}"
+: "${SATCHEL_DURABILITY:=local}"
 : "${FIO_RUNTIME:=20}"
 : "${FIO_SIZE:=256M}"
 : "${FIO_DIRECT:=1}"

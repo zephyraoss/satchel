@@ -3,8 +3,8 @@ set -euo pipefail
 
 MODE=${1:-}
 case "$MODE" in
-  native|async|remote) ;;
-  *) echo "usage: $0 native|async|remote" >&2; exit 2 ;;
+  native|local|remote) ;;
+  *) echo "usage: $0 native|local|remote" >&2; exit 2 ;;
 esac
 
 : "${SATCHEL_BIN:=./satchel}"
@@ -47,7 +47,7 @@ if [[ -e "$case_root" || -e "$result_dir" ]]; then
   exit 1
 fi
 if [[ "$MODE" == native && -n "$SATCHEL_PGBENCH_EXISTING_VOLUME" ]]; then
-	echo "SATCHEL_PGBENCH_EXISTING_VOLUME requires async or remote mode" >&2
+	echo "SATCHEL_PGBENCH_EXISTING_VOLUME requires local or remote mode" >&2
 	exit 2
 fi
 install -d -m 0755 "$SATCHEL_PGBENCH_ROOT" "$SATCHEL_PGBENCH_RESULTS"
